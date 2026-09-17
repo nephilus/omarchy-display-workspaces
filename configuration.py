@@ -7,7 +7,7 @@ import re
 import secrets
 import stat
 
-PLUGIN = "dctlab.workspaces"
+PLUGIN = "display.workspaces"
 EXACT = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*\Z")
 
 

@@ -239,7 +239,7 @@ def runtime_dir():
     session = os.environ.get("HYPRLAND_INSTANCE_SIGNATURE", "")
     if not session:
         raise ValueError("No Hyprland session is available.")
-    path = base / ("dctlab-arrange-" + hashlib.sha256(session.encode()).hexdigest()[:16])
+    path = base / ("display-workspaces-arrange-" + hashlib.sha256(session.encode()).hexdigest()[:16])
     path.mkdir(mode=0o700, exist_ok=True)
     info = path.lstat()
     if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077:
@@ -338,7 +338,7 @@ def begin(request):
         save(root, state)
         atomic(root, "active.json", {"token": token})
         args = ["systemd-run", "--user", "--quiet", "--collect", "--service-type=exec",
-                f"--unit=dctlab-arrange-{token}", "--property=Restart=on-failure",
+                f"--unit=display-workspaces-arrange-{token}", "--property=Restart=on-failure",
                 "--property=RestartSec=1", "--property=StartLimitIntervalSec=0",
                 "--property=TimeoutStopSec=25", "--property=UMask=0077"]
         for name in ("HYPRLAND_INSTANCE_SIGNATURE", "XDG_RUNTIME_DIR", "WAYLAND_DISPLAY", "PATH"):
@@ -654,7 +654,7 @@ def forget(request):
         save(root, state)
         atomic(root, "forget-active.json", {"token": token})
         args = ["systemd-run", "--user", "--quiet", "--collect", "--service-type=exec",
-                f"--unit=dctlab-forget-{token}", "--property=Restart=on-failure",
+                f"--unit=display-workspaces-forget-{token}", "--property=Restart=on-failure",
                 "--property=RestartSec=1", "--property=StartLimitIntervalSec=0",
                 "--property=TimeoutStopSec=25", "--property=UMask=0077"]
         for name in ("HOME", "XDG_CONFIG_HOME", "HYPRLAND_INSTANCE_SIGNATURE", "XDG_RUNTIME_DIR",

@@ -20,7 +20,7 @@ class ConfigurationTests(unittest.TestCase):
         self.rule_a = 'hl.monitor({ output = "A", mode = "1920x1080@60", scale = 1 })'
         self.rule_b = 'hl.monitor({ output = "B", mode = "preferred", position = "auto" })'
         self.document = {"idle": {"lock": 300}, "bar": {"layout": {"left": [
-            {"id": "dctlab.workspaces", "iconOnly": True, "displays": []},
+            {"id": "display.workspaces", "iconOnly": True, "displays": []},
             {"id": "other.widget", "displays": [{"connector": "A", "name": "Unrelated"}]}]}},
             "plugins": []}
         self.live = [{"name": "A", "make": "Vendor", "model": "Panel", "serial": "one", "width": 0}]

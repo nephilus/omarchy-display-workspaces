@@ -9,8 +9,8 @@ import qs.Commons
 
 Panel {
   id: root
-  moduleName: "omarchy.workspaces"
-  ipcTarget: "dctlab.workspaces"
+  moduleName: "display.workspaces"
+  ipcTarget: "display.workspaces"
   property var workspaceWidget: null
   property var anchor: workspaceWidget
   property var configurationEntries: []
