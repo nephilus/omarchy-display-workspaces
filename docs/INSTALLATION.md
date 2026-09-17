@@ -1,0 +1,115 @@
+# Installation and maintenance
+
+## Requirements
+
+- Omarchy with the Quickshell shell/plugin commands and host QML modules (`qs.Ui`, `qs.Commons`). Tested: Omarchy 4.0.3-1.
+- Hyprland with the Lua configuration/IPC API. Tested: 0.56.2.
+- Quickshell with Hyprland integration. Tested: 0.3.1.
+- Python 3, Git, and the normal Omarchy command dependencies such as `jq`.
+- A working systemd user manager (`systemd-run --user`) for independent preview/Forget workers.
+- `hyprctl` and `notify-send` on PATH; Omarchy's usual Nerd Font for icons.
+
+The Python code has no third-party dependencies. The repository is installed directly; do not build it or run it as a standalone `quickshell -p` configuration.
+
+## Normal GitHub installation
+
+Run this in an interactive terminal:
+
+```bash
+omarchy plugin add https://github.com/nephilus/omarchy-display-workspaces.git --enable
+```
+
+Alternatively, run `omarchy plugin add` without a URL and paste the repository URL at the prompt. The native installer clones the repository, validates its root manifest, and discovers plugin ID `dctlab.workspaces`. A graphical flow that invokes this same installer can accept the same URL; this does not imply automatic listing in a curated plugin catalog.
+
+The native install location is:
+
+```text
+~/.config/omarchy/plugins/dctlab.workspaces/
+```
+
+The folder name comes from the manifest ID, not the GitHub repository name. No personal monitor configuration is included or installed.
+
+Enable/move it explicitly if needed:
+
+```bash
+omarchy plugin enable dctlab.workspaces --section left
+```
+
+Enabling does not automatically replace `omarchy.workspaces`. If both appear, confirm the new widget works, then optionally disable the stock one:
+
+```bash
+omarchy plugin disable omarchy.workspaces
+```
+
+For unattended installation, `--yes` accepts the trust warning. Only use this after reviewing the repository:
+
+```bash
+omarchy plugin add https://github.com/nephilus/omarchy-display-workspaces.git --enable --yes
+omarchy plugin enable dctlab.workspaces --section left
+```
+
+## Existing local copy or development checkout
+
+The installer refuses duplicate plugin IDs; it does not overwrite an existing local clone. Back up your existing plugin directory and `~/.config/omarchy/shell.json` before changing how an existing installation is managed. Do not remove saved shell settings merely to adopt this repository.
+
+For development, the source can live at `~/omarchy-display-workspaces`, with a symlink at `~/.config/omarchy/plugins/dctlab.workspaces` pointing to it. Native discovery follows that link. Create it only when the destination does not already contain an installation:
+
+```bash
+git clone https://github.com/nephilus/omarchy-display-workspaces.git ~/omarchy-display-workspaces
+mkdir -p ~/.config/omarchy/plugins
+ln -s ~/omarchy-display-workspaces ~/.config/omarchy/plugins/dctlab.workspaces
+omarchy-shell shell rescanPlugins
+omarchy plugin enable dctlab.workspaces --section left
+```
+
+Do not run `plugin add` over a symlink installation. Edits outside the watched plugin directory may need an explicit shell restart to invalidate cached QML.
+
+## Updating
+
+For a native Git-managed installation:
+
+```bash
+omarchy plugin update dctlab.workspaces
+```
+
+The native updater fetches the remote default branch, asks for confirmation, and requires a fast-forward merge. Local modifications can prevent updates; preserve or commit them rather than force-resetting the checkout. For a development checkout you can also run `git pull --ff-only` from its directory.
+
+If the UI remains cached after an update:
+
+```bash
+omarchy restart shell
+```
+
+Finish or revert any preview before updating, moving, or removing the plugin: detached workers can still be using its Python files.
+
+## Disable or remove
+
+Restore the stock widget first if desired:
+
+```bash
+omarchy plugin enable omarchy.workspaces --section left
+omarchy plugin disable dctlab.workspaces
+```
+
+For a normal cloned installation, uninstall through the native command:
+
+```bash
+omarchy plugin remove dctlab.workspaces
+```
+
+For a development symlink, disable the plugin and remove only the symlink manually if you want to retain the source checkout. Back up settings before removal. Uninstalling does not undo monitor-rule changes previously confirmed with Forget; use the transaction backups described in [recovery](USAGE.md#recovery).
+
+## Troubleshooting
+
+```bash
+omarchy plugin list --json
+omarchy plugin validate ~/.config/omarchy/plugins/dctlab.workspaces
+omarchy-shell shell rescanPlugins
+omarchy-shell shell ping
+```
+
+- **Unknown plugin command or missing host imports:** the installed Omarchy generation lacks this plugin API. Use a compatible Omarchy/Quickshell setup; copying the files into Waybar will not work.
+- **Duplicate plugin ID:** an existing `dctlab.workspaces` installation must be migrated or updated, not installed a second time.
+- **Preview unavailable:** inspect the panel's reason. Geometry must be valid, the systemd user manager must work, and position changes require supported exact monitor declarations in the loaded `hypr.monitors` module.
+- **Forget disabled:** dynamic/broad rules, ambiguous hardware identity, unsafe file ownership/permissions, or a stale catalog prevent destructive edits. Review the reason instead of bypassing it.
+- **Missing icons:** use the Nerd Font configured by Omarchy.

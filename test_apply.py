@@ -1,0 +1,260 @@
+"""Guardrails whose failure could strand a display; no compositor mutations."""
+import copy
+import json
+import unittest
+import tempfile
+from pathlib import Path
+from unittest.mock import patch
+
+import apply as arrangement
+
+
+class LayoutSafetyTests(unittest.TestCase):
+    def setUp(self):
+        self.raw = [
+            {"id": 0, "name": "A", "width": 2560, "height": 1600, "scale": 2,
+             "transform": 0, "refreshRate": 60, "x": 0, "y": 0, "serial": "a"},
+            {"id": 1, "name": "B", "width": 1920, "height": 1080, "scale": 1.5,
+             "transform": 1, "refreshRate": 60, "x": 1280, "y": 0, "serial": "b"},
+        ]
+        self.current = self.discover()
+        self.plan = {"baseline": copy.deepcopy(self.current),
+                     "positions": [{"name": "A", "x": 0, "y": 0}, {"name": "B", "x": 1280, "y": 0}],
+                     "workspaces": []}
+
+    def discover(self, workspaces=None):
+        def query(kind, *args):
+            return {"monitors": self.raw,
+                    "workspaces": workspaces if workspaces is not None else [{"id": 1, "monitor": "A"}],
+                    "activewindow": {}}[kind]
+        with patch.object(arrangement, "query", side_effect=query):
+            return arrangement.snapshot()
+
+    def test_faulty_output_preserves_healthy_outputs_and_all_workspaces(self):
+        self.raw[1]["width"] = 0
+        self.raw.extend([{"name": "off", "disabled": True, "width": 0},
+                         {"name": "mirror", "mirrorOf": "A", "width": 0}])
+        workspaces = [{"id": 1, "monitor": "A"}, {"id": 2, "monitor": "B"}]
+        result = json.loads(json.dumps(self.discover(workspaces), allow_nan=False))
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["monitors"], self.current["monitors"][:1])
+        self.assertEqual(result["workspaces"], workspaces)
+        self.assertEqual(result["disabledMonitors"], self.raw[2:3])
+        self.assertEqual(result["mirroredOutputs"], ["mirror"])
+        self.assertEqual(result["unavailableMonitors"][0]["name"], "B")
+        self.assertEqual(result["unavailableMonitors"][0]["serial"], "b")
+        self.assertIn("width", result["unavailableMonitors"][0]["reason"])
+
+    def test_all_outputs_unusable_still_returns_workspace_discovery(self):
+        for monitor in self.raw:
+            monitor["height"] = 0
+        result = self.discover()
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["monitors"], [])
+        self.assertEqual({m["name"] for m in result["unavailableMonitors"]}, {"A", "B"})
+        self.assertEqual(result["workspaces"], self.current["workspaces"])
+
+    def test_missing_nonfinite_and_zero_logical_geometry_is_json_safe(self):
+        original = copy.deepcopy(self.raw[1])
+        cases = [
+            ("width", None, "width"), ("height", float("inf"), "height"),
+            ("scale", float("nan"), "scale"), ("transform", float("-inf"), "rotation"),
+            ("x", None, "X coordinate"), ("y", float("nan"), "Y coordinate"),
+            ("x", arrangement.COORD_LIMIT + 1, "X coordinate"), ("y", 0.5, "whole number"),
+            ("width", 1, "logical display"),
+        ]
+        for field, value, reason in cases:
+            with self.subTest(field=field, value=value):
+                self.raw[1] = dict(original, id=float("nan"), serial=float("inf"),
+                                   description={"nested": float("nan")})
+                if value is None:
+                    del self.raw[1][field]
+                else:
+                    self.raw[1][field] = value
+                if field == "width" and value == 1:
+                    self.raw[1]["scale"] = 16
+                result = json.loads(json.dumps(self.discover(), allow_nan=False))
+                self.assertEqual(result["monitors"], self.current["monitors"][:1])
+                unavailable = result["unavailableMonitors"][0]
+                self.assertEqual(unavailable["name"], "B")
+                self.assertIn(reason, unavailable["reason"])
+                self.assertNotIn("logicalWidth", unavailable)
+                self.assertIsNone(unavailable["id"])
+                self.assertIsNone(unavailable["serial"])
+                self.assertIsNone(unavailable["description"])
+
+    def test_ipc_failure_is_not_partial_discovery(self):
+        self.raw[1]["width"] = 0
+        def query(kind, *args):
+            if kind == "monitors":
+                return self.raw
+            raise RuntimeError("IPC unavailable")
+        with patch.object(arrangement, "query", side_effect=query):
+            with self.assertRaisesRegex(RuntimeError, "IPC unavailable"):
+                arrangement.snapshot()
+
+    def test_degraded_baseline_requires_refresh_after_output_recovers(self):
+        self.raw[1]["width"] = 0
+        self.plan["baseline"] = self.discover()
+        with self.assertRaisesRegex(ValueError, "B"):
+            self.validate()
+        self.raw[1]["width"] = 1920
+        self.plan["baseline"] = self.discover()
+        self.assertTrue(self.validate()["ok"])
+
+    def test_omitting_faulty_output_cannot_begin_or_keep_trial(self):
+        self.raw[1]["width"] = 0
+        degraded = self.discover()
+        self.plan["baseline"] = copy.deepcopy(degraded)
+        self.plan["baseline"].pop("unavailableMonitors")
+        self.plan["positions"] = self.plan["positions"][:1]
+        token = "b" * 48
+        state = {"token": token, "state": "pending", "phase": "waiting", "request": "",
+                 "deadline": 0, "message": "Preview", "baseline": self.plan["baseline"],
+                 "plan": self.plan}
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with patch.object(arrangement, "runtime_dir", return_value=root):
+                with patch.object(arrangement, "snapshot", return_value=degraded):
+                    with self.assertRaisesRegex(ValueError, "B"):
+                        arrangement.begin(self.plan)
+                    self.assertFalse((root / "active.json").exists())
+                    arrangement.save(root, state)
+                    with self.assertRaisesRegex(ValueError, "B"):
+                        arrangement.control("keep", token)
+                    self.assertEqual(arrangement.load(root, token)["request"], "")
+
+    def test_output_failure_between_preflight_and_mutation_blocks_changes(self):
+        self.raw[1]["width"] = 0
+        degraded = self.discover()
+        with patch.object(arrangement, "snapshot", return_value=degraded):
+            with patch.object(arrangement, "lua_eval") as mutate:
+                with self.assertRaisesRegex(ValueError, "B"):
+                    arrangement.set_positions(self.current, [{"name": "A", "x": 0, "y": 50}])
+                with self.assertRaisesRegex(ValueError, "B"):
+                    arrangement.move_workspace(self.current, 1, "A")
+                with self.assertRaisesRegex(ValueError, "B"):
+                    arrangement.restore_view(self.current)
+                mutate.assert_not_called()
+
+    def test_rollback_restores_healthy_output_while_reporting_faulty_output(self):
+        self.raw[0]["y"] = 50
+        self.raw[1]["width"] = 0
+        degraded = self.discover()
+        commands = []
+        with patch.object(arrangement, "snapshot", return_value=degraded):
+            with patch.object(arrangement, "lua_eval", side_effect=commands.append):
+                with patch.object(arrangement.time, "monotonic", side_effect=[0, 4]):
+                    errors = arrangement.rollback({"baseline": self.current, "plan": {"displayChanges": 1}})
+        self.assertEqual(len(commands), 1)
+        self.assertIn('output="A"', commands[0])
+        self.assertIn('position="0x0"', commands[0])
+        self.assertNotIn('output="B"', commands[0])
+        self.assertTrue(any("B" in error and "unavailable" in error for error in errors))
+
+    def validate(self):
+        return arrangement.validate(self.plan, self.current)
+
+    def test_scaled_rotated_edge_contact_is_valid(self):
+        self.assertTrue(self.validate()["ok"])
+        # Rotated B is 720 logical pixels wide, so C can touch its right edge.
+        c = dict(self.current["monitors"][0], id=2, name="C", x=2000, y=0, serial="c")
+        self.current["monitors"].append(c)
+        self.plan["baseline"] = copy.deepcopy(self.current)
+        self.plan["positions"].append({"name": "C", "x": 2000, "y": 0})
+        self.assertTrue(self.validate()["ok"])
+        self.plan["positions"][2]["x"] = 1999
+        with self.assertRaises(ValueError):
+            self.validate()
+
+    def test_one_pixel_overlap_is_rejected(self):
+        self.plan["positions"][1]["x"] = 1279
+        with self.assertRaises(ValueError):
+            self.validate()
+
+    def test_corner_contact_is_not_a_connected_desktop(self):
+        self.plan["positions"][1]["y"] = 800
+        with self.assertRaises(ValueError):
+            self.validate()
+
+    def test_gap_is_rejected(self):
+        self.plan["positions"][1]["x"] = 1281
+        with self.assertRaises(ValueError):
+            self.validate()
+
+    def test_negative_origin_is_normalized_without_layout_change(self):
+        for p in self.plan["positions"]:
+            p["x"] -= 1280
+            p["y"] -= 400
+        result = self.validate()
+        self.assertEqual(result["displayChanges"], 0)
+        self.assertEqual(result["positions"], [{"name": "A", "x": 0, "y": 0}, {"name": "B", "x": 1280, "y": 0}])
+
+    def test_changed_hardware_identity_invalidates_preview(self):
+        self.current["monitors"][1]["serial"] = "replacement"
+        with self.assertRaises(ValueError):
+            self.validate()
+
+    def test_stale_workspace_source_is_rejected(self):
+        self.plan["workspaces"] = [{"id": 1, "source": "A", "target": "B"}]
+        self.current["workspaces"][0]["monitor"] = "B"
+        with self.assertRaises(ValueError):
+            self.validate()
+
+    def test_nonfinite_position_is_rejected(self):
+        self.plan["positions"][1]["x"] = float("nan")
+        with self.assertRaises(ValueError):
+            self.validate()
+
+    def test_unrequested_workspace_drift_invalidates_trial(self):
+        self.current["workspaces"][0]["monitor"] = "B"
+        with patch.object(arrangement, "snapshot", return_value=self.current):
+            with self.assertRaises(ValueError):
+                arrangement.verify_arrangement(self.plan["baseline"], self.plan["positions"], [])
+
+    def test_rollback_does_not_expose_overlapping_intermediate_layout(self):
+        baseline = copy.deepcopy(self.current)
+        self.current["monitors"][0].update(x=0, y=1280)
+        self.current["monitors"][1].update(x=0, y=0)
+        overlapping_frames = []
+
+        def commit(_baseline, positions, force=False, recovery=False):
+            for position in positions:
+                monitor = next(m for m in self.current["monitors"] if m["name"] == position["name"])
+                monitor.update(x=position["x"], y=position["y"])
+            a, b = self.current["monitors"]
+            dx = min(a["x"] + a["logicalWidth"], b["x"] + b["logicalWidth"]) - max(a["x"], b["x"])
+            dy = min(a["y"] + a["logicalHeight"], b["y"] + b["logicalHeight"]) - max(a["y"], b["y"])
+            if dx > 0 and dy > 0:
+                overlapping_frames.append(copy.deepcopy(self.current["monitors"]))
+
+        with patch.object(arrangement, "snapshot", side_effect=lambda: copy.deepcopy(self.current)):
+            with patch.object(arrangement, "set_positions", side_effect=commit):
+                errors = arrangement.rollback({"baseline": baseline, "plan": {"displayChanges": 2}})
+        self.assertEqual(errors, [])
+        self.assertEqual(overlapping_frames, [])
+        self.assertEqual(self.current["monitors"], baseline["monitors"])
+
+    def test_recovery_preserves_countdown_and_does_not_revive_finished_preview(self):
+        token = "a" * 48
+        state = {"token": token, "state": "pending", "phase": "waiting",
+                 "deadline": 112, "message": "Preview", "uiScreen": "A",
+                 "baseline": self.current, "plan": self.plan}
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            arrangement.save(root, state)
+            arrangement.atomic(root, "active.json", {"token": token})
+            with patch.object(arrangement, "runtime_dir", return_value=root):
+                with patch.object(arrangement.time, "monotonic", return_value=100):
+                    recovered = arrangement.resume()
+                self.assertEqual(recovered["token"], token)
+                self.assertEqual(recovered["secondsRemaining"], 12)
+                with patch.object(arrangement.time, "monotonic", return_value=108):
+                    self.assertEqual(arrangement.resume()["secondsRemaining"], 4)
+                state["state"] = "kept"
+                arrangement.save(root, state)
+                self.assertNotIn("token", arrangement.resume())
+
+
+if __name__ == "__main__":
+    unittest.main()

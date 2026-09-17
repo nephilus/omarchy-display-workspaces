@@ -1,0 +1,75 @@
+# Usage, safety, and recovery
+
+## Bar and presentation
+
+Right-click a display label to open the arrangement panel. The green display highlight follows the cursor; it is not a substitute for keyboard/workspace focus indicators.
+
+In **Workspaces**, edit a display's name or choose a curated Nerd Font icon. Use the ordering controls to change the presentation order. These preferences save immediately in the `dctlab.workspaces` bar entry in `~/.config/omarchy/shell.json`; they do not require Preview or Apply.
+
+A unique hardware identity is preferred when matching saved settings after a connector changes. Connector names are the fallback. Disconnected displays retain their saved settings until explicitly forgotten.
+
+**Detect displays** refreshes discovery without clearing saved names, icons, or ordering. Hotplug events also refresh the models.
+
+## Session layout and workspace moves
+
+Use **Displays** to position outputs on the map or with position/relative-placement controls. Use **Workspaces** to move workspace cards between display columns.
+
+1. Make the desired changes in the panel.
+2. Click **Preview (20s)**.
+3. Check the live result.
+4. Click **Apply** within the countdown to keep it, or cancel/wait to revert.
+
+Apply keeps the arrangement **for this session only**. It does not persist display positions or workspace bindings into Hyprland configuration. Reloading configuration or restarting the session can reapply your existing rules. The plugin does not provide profiles, resolution selection, or a replacement for a full monitor-settings application.
+
+Preview uses an independent systemd user worker, so a recreated bar does not eliminate the rollback timer. It rejects stale hardware/topology and unsafe geometry. Recovery is best-effort if displays disconnect or their modes change: an unavailable physical display cannot always be restored automatically.
+
+When an output reports zero size or other invalid geometry, healthy displays and workspace cards remain visible. Names/icons/order and the configuration catalog remain accessible; unsafe layout actions stay blocked. This protects against bad geometry but does not fix the underlying driver, cable, or compositor problem.
+
+## Forget display
+
+The selector in **Workspaces** combines:
+
+- **Rule only:** a configured monitor with no saved widget customization; its connector name is shown.
+- **Customization only:** saved name/icon/order information without a matching supported monitor rule.
+- **Rule + customization:** both exist and can be matched safely.
+
+Choose the entry, click **Forget display**, read the warning, then click **Confirm forget**. Cancel leaves files unchanged.
+
+For a supported configured monitor, confirmation removes its exact `hl.monitor(...)` declaration(s) from `~/.config/hypr/monitors.lua` and its matching saved customization from shell settings. A customization-only entry changes only shell settings. `XDG_CONFIG_HOME` is honored for these configuration paths.
+
+Changed files are backed up before atomic replacement. Rule changes trigger `hyprctl reload` followed by a configuration-error check. An active display can immediately change mode or placement when its rule is removed. Forget does not unplug, disable, or permanently hide a monitor; compositor fallback rules may still configure it, and it can still appear among live outputs.
+
+The worker continues independently if the initiating panel disappears, and reports the result through a desktop notification. Backup paths are included in successful feedback and notifications.
+
+### Supported declarations and refusal conditions
+
+The nonexecuting parser supports standalone flat literal tables, including multiline calls, comments, quoted/long strings, and optional semicolons. Example:
+
+```lua
+hl.monitor({ output = "DP-1", mode = "1920x1080@60", position = "auto", scale = 1 })
+```
+
+Automatic removal is intentionally limited to exact connector selectors. Dynamic/computed declarations, conditionals, description/broad selectors, or ambiguous identity matches are not rewritten. A broad/unknown rule can prevent other entries being removed because it may also target them. Read the displayed reason and edit such configurations manually.
+
+Both source files and discovered hardware identity participate in the confirmation revision. A concurrent change requires detection and a fresh confirmation. Preview and Forget cannot mutate configuration concurrently. Files/directories must satisfy the backend's ownership, permission, and nonsymlink safety checks.
+
+## Recovery
+
+Transaction backups are exact original bytes stored beside each changed file:
+
+```text
+monitors.lua.forget-<transaction-token>.bak
+shell.json.forget-<transaction-token>.bak
+```
+
+A failed reload attempts to restore the originals and reload the restored monitor configuration. If a file has been edited externally since the transaction wrote it, the worker preserves that edit rather than overwriting it; the error explains that manual recovery is needed and identifies backups.
+
+To recover manually:
+
+1. Read the error/notification and locate that transaction's backups.
+2. Preserve the current files before further editing.
+3. Compare each backup with its current file. Merge only the rule or preferences you want restored; copying an old whole file can erase newer changes.
+4. After restoring Lua rules, run `hyprctl reload`, then `hyprctl configerrors` and check that no errors remain.
+5. Shell settings normally reload automatically; use `omarchy restart shell` if the UI remains stale.
+
+Do not restore unrelated workstation configuration from someone else's example or backup. This repository intentionally contains no personal `shell.json`, `monitors.lua`, monitor serial numbers, or desktop screenshots.

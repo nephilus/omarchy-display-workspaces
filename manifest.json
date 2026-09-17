@@ -1,0 +1,23 @@
+{
+  "schemaVersion": 1,
+  "id": "dctlab.workspaces",
+  "name": "Display Workspaces",
+  "version": "1.8.0",
+  "author": "nephilus (based on Omarchy)",
+  "description": "Hotplug-aware display workspace groups with cursor-following highlights and compact translucent arrangement",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "Workspaces.qml"
+  },
+  "barWidget": {
+    "displayName": "Display Workspaces",
+    "description": "The green display highlight follows the cursor. Displays update automatically when connected or disconnected; Detect displays reloads the current layout without clearing saved names, icons, or ordering. Faulty outputs are reported separately without hiding healthy displays or workspace cards; unsafe layout changes stay blocked until usable modes recover. Right-click a display for compact, translucent Displays and Workspaces tabs. Rename, choose a curated Nerd Font icon, and reorder columns in Workspaces; presentation preferences save immediately. Forget display lists configured monitor rules and saved preferences, including entries without custom names or icons. Confirmation removes the selected exact monitor rule and matching preferences, backs up changed files, and reloads Hyprland when a rule changes. Removing an active rule can change its mode or layout immediately. Dynamic or ambiguous rules are shown but cannot be removed automatically. For live geometry and workspace moves, Preview (20s), then Apply to keep. No profiles.",
+    "category": "Compositor",
+    "allowMultiple": false
+  },
+  "omarchy": {
+    "clonedFrom": "omarchy.workspaces"
+  }
+}
