@@ -33,6 +33,8 @@ Resizing a draft display leaves the other coordinates unchanged. Gaps, overlaps,
 
 Preview uses an independent systemd user worker, so a recreated bar does not eliminate the rollback timer. It rejects stale hardware/topology, changed mode catalogs, and unsafe geometry. Cancel/expiry restores original modes, scales, rotations, and positions. Recovery is best-effort if a display disconnects, becomes unusable, or its geometry changes externally: the worker preserves unrelated external geometry instead of overwriting it, and reports incomplete recovery.
 
+Hyprland can create temporary replacement workspaces when an active workspace moves. Workspaces known to be empty and nonpersistent at Preview start may disappear as focus changes; their disappearance does not fail Preview or recovery, and the plugin does not recreate or pin them. Populated or persistent workspaces must remain present, and every surviving starting workspace must retain its intended display.
+
 When an output reports zero size or other invalid geometry, healthy displays and workspace cards remain visible. Names/icons/order and the configuration catalog remain accessible; unsafe layout actions stay blocked. This protects against bad geometry but does not fix the underlying driver, cable, or compositor problem.
 
 ## Manual profiles

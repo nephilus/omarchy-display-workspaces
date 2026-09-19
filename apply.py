@@ -492,8 +492,16 @@ def set_positions(baseline, positions, force=False, recovery=False):
         lua_eval(''.join("do " + guard + "end; " for guard, _ in pieces) + ''.join(code for _, code in pieces))
 
 
+def workspace_may_expire(baseline, wid):
+    # Hyprland may release empty, nonpersistent workspaces when they stop being
+    # visible. Missing lifecycle metadata must remain a strict failure.
+    return any(w["id"] == wid and type(w.get("windows")) is int and w["windows"] == 0
+               and w.get("ispersistent") is False for w in baseline["workspaces"])
+
+
 def move_workspace(baseline, wid, target, expected_source=None, recovery=False):
     originals = indexed(baseline["monitors"], "name", "display")
+    may_expire = workspace_may_expire(baseline, wid)
     current = snapshot()
     if not recovery:
         require_usable_outputs(baseline, current)
@@ -502,14 +510,18 @@ def move_workspace(baseline, wid, target, expected_source=None, recovery=False):
     if target not in live or not same_identity(originals[target], live[target]):
         raise ValueError(f"Workspace {wid}: original display {target} is unavailable.")
     if workspace is None:
+        if may_expire:
+            return
         raise ValueError(f"Workspace {wid} disappeared.")
     if expected_source is not None and workspace["monitor"] != expected_source:
         raise ValueError(f"Workspace {wid} moved externally.")
     if workspace["monitor"] == target:
         return
     source = lua_string(workspace["monitor"])
-    lua_eval(monitor_guard(live[target]) + f"local w=hl.get_workspace({wid}); "
-             f"assert(w and w.monitor and w.monitor.name=={source}, 'Workspace source changed'); "
+    code = monitor_guard(live[target]) + f"local w=hl.get_workspace({wid}); "
+    if may_expire:
+        code += "if not w then return end; "
+    lua_eval(code + f"assert(w and w.monitor and w.monitor.name=={source}, 'Workspace source changed'); "
              f"local r=hl.dispatch(hl.dsp.workspace.move({{workspace={wid},monitor={lua_string(target)}}})); "
              "assert(not r or r.ok~=false, 'Workspace move failed')")
 
@@ -548,6 +560,8 @@ def verify_arrangement(baseline, positions, moves):
     expected = {w["id"]: w["monitor"] for w in baseline["workspaces"] if w["id"] > 0}
     expected.update({move["id"]: move["target"] for move in moves})
     for wid, target in expected.items():
+        if wid not in workspaces and workspace_may_expire(baseline, wid):
+            continue
         if workspaces.get(wid, {}).get("monitor") != target:
             raise ValueError(f"Workspace {wid} did not retain its intended display {target}.")
 
