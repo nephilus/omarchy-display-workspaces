@@ -1,6 +1,8 @@
 """Guardrails whose failure could strand a display; no compositor mutations."""
+import contextlib
 import copy
 import json
+import re
 import unittest
 import tempfile
 from pathlib import Path
@@ -13,13 +15,16 @@ class LayoutSafetyTests(unittest.TestCase):
     def setUp(self):
         self.raw = [
             {"id": 0, "name": "A", "width": 2560, "height": 1600, "scale": 2,
-             "transform": 0, "refreshRate": 60, "x": 0, "y": 0, "serial": "a"},
+             "transform": 0, "refreshRate": 60, "x": 0, "y": 0, "serial": "a",
+             "availableModes": ["2560x1600@60Hz", "1920x1200@75Hz", "1920x1080@60Hz"]},
             {"id": 1, "name": "B", "width": 1920, "height": 1080, "scale": 1.5,
-             "transform": 1, "refreshRate": 60, "x": 1280, "y": 0, "serial": "b"},
+             "transform": 1, "refreshRate": 60, "x": 1280, "y": 0, "serial": "b",
+             "availableModes": ["1920x1080@60Hz", "1600x900@75Hz"]},
         ]
         self.current = self.discover()
         self.plan = {"baseline": copy.deepcopy(self.current),
-                     "positions": [{"name": "A", "x": 0, "y": 0}, {"name": "B", "x": 1280, "y": 0}],
+                     "positions": [{key: monitor[key] for key in arrangement.POSITION}
+                                   for monitor in self.current["monitors"]],
                      "workspaces": []}
 
     def discover(self, workspaces=None):
@@ -29,6 +34,42 @@ class LayoutSafetyTests(unittest.TestCase):
                     "activewindow": {}}[kind]
         with patch.object(arrangement, "query", side_effect=query):
             return arrangement.snapshot()
+
+    @contextlib.contextmanager
+    def compositor(self, fail_after=None):
+        """Apply monitor IPC to isolated state; never invoke a real compositor."""
+        batches = []
+        failing = fail_after is not None
+
+        def execute(code):
+            nonlocal failing
+            rules = re.findall(r"hl\.monitor\(\{([^}]+)\}\)", code)
+            if not rules:
+                return
+            batches.append(len(rules))
+            for index, rule in enumerate(rules):
+                if failing and index == fail_after:
+                    failing = False
+                    raise ValueError("Synthetic monitor apply failure")
+                fields = dict(re.findall(r'(\w+)=("[^"]*"|[^,]+)', rule))
+                fields = {key: json.loads(value) for key, value in fields.items()}
+                monitor = next(m for m in self.current["monitors"] if m["name"] == fields["output"])
+                width, height, refresh = re.fullmatch(r"(\d+)x(\d+)@([\d.]+)", fields["mode"]).groups()
+                x, y = fields["position"].split("x")
+                monitor.update(width=int(width), height=int(height), refreshRate=float(refresh),
+                               scale=fields["scale"], transform=fields["transform"], x=int(x), y=int(y))
+                monitor["logicalWidth"], monitor["logicalHeight"] = arrangement.logical_size(monitor, monitor["transform"])
+
+        with patch.object(arrangement, "snapshot", side_effect=lambda: copy.deepcopy(self.current)), \
+                patch.object(arrangement, "lua_eval", side_effect=execute), \
+                patch.object(arrangement, "require_exact_rules"):
+            yield batches
+
+    def mode_plan(self):
+        self.plan["positions"][0].update(width=1920, height=1200, refreshRate=75, scale=1.5)
+        self.plan["positions"][1].update(width=1600, height=900, refreshRate=75, scale=1.25)
+        return self.validate()
+
 
     def test_faulty_output_preserves_healthy_outputs_and_all_workspaces(self):
         self.raw[1]["width"] = 0
@@ -130,7 +171,7 @@ class LayoutSafetyTests(unittest.TestCase):
         with patch.object(arrangement, "snapshot", return_value=degraded):
             with patch.object(arrangement, "lua_eval") as mutate:
                 with self.assertRaisesRegex(ValueError, "B"):
-                    arrangement.set_positions(self.current, [{"name": "A", "x": 0, "y": 50}])
+                    arrangement.set_positions(self.current, [dict(self.plan["positions"][0], y=50)])
                 with self.assertRaisesRegex(ValueError, "B"):
                     arrangement.move_workspace(self.current, 1, "A")
                 with self.assertRaisesRegex(ValueError, "B"):
@@ -138,18 +179,14 @@ class LayoutSafetyTests(unittest.TestCase):
                 mutate.assert_not_called()
 
     def test_rollback_restores_healthy_output_while_reporting_faulty_output(self):
-        self.raw[0]["y"] = 50
-        self.raw[1]["width"] = 0
-        degraded = self.discover()
-        commands = []
-        with patch.object(arrangement, "snapshot", return_value=degraded):
-            with patch.object(arrangement, "lua_eval", side_effect=commands.append):
-                with patch.object(arrangement.time, "monotonic", side_effect=[0, 4]):
-                    errors = arrangement.rollback({"baseline": self.current, "plan": {"displayChanges": 1}})
-        self.assertEqual(len(commands), 1)
-        self.assertIn('output="A"', commands[0])
-        self.assertIn('position="0x0"', commands[0])
-        self.assertNotIn('output="B"', commands[0])
+        self.plan["positions"][0]["y"] = 50
+        self.current["monitors"][0]["y"] = 50
+        self.current["monitors"].pop()
+        self.current["unavailableMonitors"] = [{"name": "B", "reason": "Display geometry is unavailable."}]
+        with self.compositor(), patch.object(arrangement.time, "monotonic", side_effect=[0, 4]):
+            errors = arrangement.rollback({"baseline": self.plan["baseline"],
+                                           "plan": {**self.plan, "displayChanges": 1}})
+        self.assertEqual(self.current["monitors"][0]["y"], 0)
         self.assertTrue(any("B" in error and "unavailable" in error for error in errors))
 
     def validate(self):
@@ -161,7 +198,7 @@ class LayoutSafetyTests(unittest.TestCase):
         c = dict(self.current["monitors"][0], id=2, name="C", x=2000, y=0, serial="c")
         self.current["monitors"].append(c)
         self.plan["baseline"] = copy.deepcopy(self.current)
-        self.plan["positions"].append({"name": "C", "x": 2000, "y": 0})
+        self.plan["positions"].append({key: c[key] for key in arrangement.POSITION})
         self.assertTrue(self.validate()["ok"])
         self.plan["positions"][2]["x"] = 1999
         with self.assertRaises(ValueError):
@@ -188,7 +225,8 @@ class LayoutSafetyTests(unittest.TestCase):
             p["y"] -= 400
         result = self.validate()
         self.assertEqual(result["displayChanges"], 0)
-        self.assertEqual(result["positions"], [{"name": "A", "x": 0, "y": 0}, {"name": "B", "x": 1280, "y": 0}])
+        self.assertEqual(result["positions"], [{key: m[key] for key in arrangement.POSITION}
+                                               for m in self.current["monitors"]])
 
     def test_changed_hardware_identity_invalidates_preview(self):
         self.current["monitors"][1]["serial"] = "replacement"
@@ -216,24 +254,127 @@ class LayoutSafetyTests(unittest.TestCase):
         baseline = copy.deepcopy(self.current)
         self.current["monitors"][0].update(x=0, y=1280)
         self.current["monitors"][1].update(x=0, y=0)
-        overlapping_frames = []
-
-        def commit(_baseline, positions, force=False, recovery=False):
-            for position in positions:
-                monitor = next(m for m in self.current["monitors"] if m["name"] == position["name"])
-                monitor.update(x=position["x"], y=position["y"])
-            a, b = self.current["monitors"]
-            dx = min(a["x"] + a["logicalWidth"], b["x"] + b["logicalWidth"]) - max(a["x"], b["x"])
-            dy = min(a["y"] + a["logicalHeight"], b["y"] + b["logicalHeight"]) - max(a["y"], b["y"])
-            if dx > 0 and dy > 0:
-                overlapping_frames.append(copy.deepcopy(self.current["monitors"]))
-
-        with patch.object(arrangement, "snapshot", side_effect=lambda: copy.deepcopy(self.current)):
-            with patch.object(arrangement, "set_positions", side_effect=commit):
-                errors = arrangement.rollback({"baseline": baseline, "plan": {"displayChanges": 2}})
+        positions = [{key: m[key] for key in arrangement.POSITION} for m in self.current["monitors"]]
+        with self.compositor() as batches:
+            errors = arrangement.rollback({"baseline": baseline,
+                                           "plan": {"displayChanges": 2, "positions": positions}})
         self.assertEqual(errors, [])
-        self.assertEqual(overlapping_frames, [])
+        self.assertEqual(batches, [2])
         self.assertEqual(self.current["monitors"], baseline["monitors"])
+
+    def test_discovery_filters_and_deduplicates_advertised_modes(self):
+        self.raw[0]["availableModes"] = [
+            "1920x1080@59.94Hz", "01920x01080@59.940000", "1920x1080@60.000001Hz",
+            "0x1080@60Hz", "1920x1080@nanHz", "preferred", {}, "1920x1080@60Hz;disable",
+        ]
+        monitor = self.discover()["monitors"][0]
+        options = monitor["modeOptions"]
+        self.assertEqual({mode["value"] for mode in options},
+                         {"1920x1080@59.94", "1920x1080@60.000001"})
+        self.assertEqual([(mode["width"], mode["height"], mode["refreshRate"]) for mode in options],
+                         [(1920, 1080, 60.000001), (1920, 1080, 59.94)])
+        self.assertEqual((monitor["width"], monitor["height"], monitor["refreshRate"]), (2560, 1600, 60))
+
+    def test_changed_mode_and_scale_use_draft_geometry_for_edge_checks(self):
+        self.plan["positions"][0].update(width=1920, height=1080, scale=2)
+        with self.assertRaisesRegex(ValueError, "share an edge"):
+            self.validate()
+        self.plan["positions"][1]["x"] = 960
+        self.assertEqual(self.validate()["displayChanges"], 2)
+        self.plan["positions"][1]["x"] = 959
+        with self.assertRaisesRegex(ValueError, "overlap"):
+            self.validate()
+
+    def test_unadvertised_mode_and_changed_catalog_are_rejected(self):
+        self.plan["positions"][0]["refreshRate"] = 120
+        with self.assertRaisesRegex(ValueError, "not advertised"):
+            self.validate()
+        self.plan["positions"][0]["refreshRate"] = 60
+        self.current["monitors"][0]["modeOptions"].pop()
+        with self.assertRaisesRegex(ValueError, "advertised modes changed"):
+            self.validate()
+
+    def test_current_custom_timing_is_preserved_and_rounded_rates_match(self):
+        self.raw[0]["refreshRate"] = 59.95123
+        self.current = self.discover()
+        self.plan["baseline"] = copy.deepcopy(self.current)
+        self.plan["positions"][0]["refreshRate"] = 59.95
+        result = self.validate()
+        self.assertEqual(result["positions"][0]["refreshRate"], 59.95123)
+        self.assertEqual(result["displayChanges"], 0)
+        plan = self.mode_plan()
+        with self.compositor():
+            arrangement.set_positions(self.plan["baseline"], plan["positions"])
+            self.current["monitors"][0]["refreshRate"] = 75.004
+            arrangement.verify_arrangement(self.plan["baseline"], plan["positions"], [])
+            self.current["monitors"][0]["refreshRate"] = 75.02
+            with self.assertRaises(ValueError):
+                arrangement.verify_arrangement(self.plan["baseline"], plan["positions"], [])
+
+    def test_scale_requires_quantization_and_integral_logical_pixels(self):
+        for scale, reason in ((1.3333, "1/120"), (1.3, "integral"), ("auto", "Invalid")):
+            with self.subTest(scale=scale):
+                self.plan["positions"][0]["scale"] = scale
+                with self.assertRaisesRegex(ValueError, reason):
+                    self.validate()
+
+    def test_mode_scale_rollback_preserves_foreign_settings(self):
+        plan = self.mode_plan()
+        baseline = self.plan["baseline"]
+        with self.compositor():
+            arrangement.set_positions(baseline, plan["positions"])
+            self.current["monitors"][0]["sdrBrightness"] = 0.7
+            with patch.object(arrangement.time, "monotonic", side_effect=[0, 4]):
+                errors = arrangement.rollback({"baseline": baseline, "plan": plan})
+        self.assertTrue(errors)
+        for old, actual in zip(baseline["monitors"], self.current["monitors"]):
+            self.assertEqual({key: actual[key] for key in arrangement.POSITION},
+                             {key: old[key] for key in arrangement.POSITION})
+        self.assertEqual(self.current["monitors"][0]["sdrBrightness"], 0.7)
+
+    def test_rollback_preserves_external_geometry_and_replaced_identity(self):
+        plan = self.mode_plan()
+        baseline = self.plan["baseline"]
+        for change in ({"x": 12}, {"refreshRate": 80}, {"scale": 2}, {"transform": 2}, {"serial": "replacement"}):
+            with self.subTest(change=change):
+                self.current = copy.deepcopy(baseline)
+                with self.compositor():
+                    arrangement.set_positions(baseline, plan["positions"])
+                    self.current["monitors"][0].update(change)
+                    external = copy.deepcopy(self.current["monitors"][0])
+                    with patch.object(arrangement.time, "monotonic", side_effect=[0, 4]):
+                        errors = arrangement.rollback({"baseline": baseline, "plan": plan})
+                self.assertTrue(errors)
+                self.assertEqual(self.current["monitors"][0], external)
+                self.assertEqual(self.current["monitors"][1], baseline["monitors"][1])
+
+    def test_worker_restores_modes_after_partial_apply_failure(self):
+        plan = self.mode_plan()
+        token = "c" * 48
+        state = {"token": token, "state": "starting", "phase": "prepared", "request": "",
+                 "message": "Starting", "mutationStarted": False, "baseline": self.plan["baseline"], "plan": plan}
+        with tempfile.TemporaryDirectory() as directory, self.compositor(fail_after=1):
+            root = Path(directory)
+            arrangement.save(root, state)
+            arrangement.worker(root, token)
+            finished = arrangement.load(root, token)
+        self.assertEqual(finished["state"], "failed")
+        self.assertEqual(self.current["monitors"], self.plan["baseline"]["monitors"])
+
+    def test_restarted_worker_restores_own_mode_changes_without_resuming_trial(self):
+        plan = self.mode_plan()
+        token = "d" * 48
+        state = {"token": token, "state": "pending", "phase": "waiting", "request": "keep",
+                 "message": "Preview", "deadline": 0, "mutationStarted": True,
+                 "baseline": self.plan["baseline"], "plan": plan}
+        with tempfile.TemporaryDirectory() as directory, self.compositor():
+            root = Path(directory)
+            arrangement.set_positions(state["baseline"], plan["positions"])
+            arrangement.save(root, state)
+            arrangement.worker(root, token)
+            finished = arrangement.load(root, token)
+        self.assertEqual(finished["state"], "failed")
+        self.assertEqual(self.current["monitors"], state["baseline"]["monitors"])
 
     def test_recovery_preserves_countdown_and_does_not_revive_finished_preview(self):
         token = "a" * 48
@@ -249,6 +390,7 @@ class LayoutSafetyTests(unittest.TestCase):
                     recovered = arrangement.resume()
                 self.assertEqual(recovered["token"], token)
                 self.assertEqual(recovered["secondsRemaining"], 12)
+                self.assertEqual(recovered["plan"]["positions"], self.plan["positions"])
                 with patch.object(arrangement.time, "monotonic", return_value=108):
                     self.assertEqual(arrangement.resume()["secondsRemaining"], 4)
                 state["state"] = "kept"

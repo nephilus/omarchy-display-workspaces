@@ -77,6 +77,10 @@ Version 2.0 changes the plugin ID to **`display.workspaces`**. A Git pull alone 
 
 Do not enable a second empty entry or remove the old settings before preserving them. Update any personal IPC shortcuts to target `display.workspaces`. The old plugin/IPC ID is not retained as an alias.
 
+## Upgrading from 2.0
+
+Version 2.1 adds session-only resolution/refresh-rate and scale controls without changing the plugin ID or saved presentation settings. Finish or revert any active preview before updating: the worker and panel now exchange complete draft geometry. Existing supported exact connector rules are still required for display changes. No new package, profile store, or background service is installed.
+
 ## Updating
 
 For a native Git-managed installation:
@@ -123,6 +127,6 @@ omarchy-shell shell ping
 
 - **Unknown plugin command or missing host imports:** the installed Omarchy generation lacks this plugin API. Use a compatible Omarchy/Quickshell setup; copying the files into Waybar will not work.
 - **Duplicate plugin ID:** an existing `display.workspaces` installation must be migrated or updated, not installed a second time.
-- **Preview unavailable:** inspect the panel's reason. Geometry must be valid, the systemd user manager must work, and position changes require supported exact monitor declarations in the loaded `hypr.monitors` module.
+- **Preview unavailable:** inspect the panel's reason. Geometry must be valid, the systemd user manager must work, and display changes require supported exact monitor declarations in the loaded `hypr.monitors` module. Refresh after a mode catalog changes; repair draft gaps/overlaps after changing resolution or scale.
 - **Forget disabled:** dynamic/broad rules, ambiguous hardware identity, unsafe file ownership/permissions, or a stale catalog prevent destructive edits. Review the reason instead of bypassing it.
 - **Missing icons:** use the Nerd Font configured by Omarchy.

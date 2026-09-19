@@ -2,9 +2,9 @@
   "schemaVersion": 1,
   "id": "display.workspaces",
   "name": "Omarchy Display Workspaces",
-  "version": "2.0.0",
+  "version": "2.1.0",
   "author": "nephilus (based on Omarchy)",
-  "description": "Hotplug-aware display workspace groups with cursor-following highlights and compact translucent arrangement",
+  "description": "Display workspace groups with safe session-only resolution, scale, and layout previews",
   "kinds": [
     "bar-widget"
   ],

@@ -49,6 +49,7 @@ Panel {
   }
   property var positions: []
   property var draft: []
+  property var geometryNotices: ({})
   property string message: ""
   property bool messageIsError: false
   property string validationMessage: "Loading current displays…"
@@ -85,6 +86,9 @@ Panel {
   readonly property bool editable: preferencesEditable && !layoutBlocked
   readonly property var selectedDisplay: displays.filter(function(m) { return m.name === selectedName })[0] || null
   readonly property var selectedPosition: positions.filter(function(p) { return p.name === selectedName })[0] || null
+  readonly property var selectedGeometry: logicalGeometry(selectedDisplay, selectedPosition)
+  readonly property var selectedModeOptions: displayModeOptions(selectedDisplay)
+  readonly property var selectedScaleOptions: displayScaleOptions(selectedDisplay, selectedPosition)
   readonly property string panelScreen: anchor && anchor.QsWindow.window && anchor.QsWindow.window.screen ? anchor.QsWindow.window.screen.name : ""
 
   function close() {
@@ -240,6 +244,7 @@ Panel {
   function invalidateValidation() {
     revision++
     valid = false
+    changeCount = 0
     validationTimer.stop()
   }
   onMonitorHealthChanged: {
@@ -286,7 +291,10 @@ Panel {
     displays = result.monitors.map(function(m) { return Object.assign({}, m, { label: m.name, icon: "\uf108" }) })
     unavailableMonitors = (result.unavailableMonitors || []).map(function(m) { return Object.assign({}, m, { label: m.name, icon: "\uf108" }) })
     refreshPresentation()
-    positions = displays.map(function(m) { return { name: m.name, x: m.x, y: m.y } })
+    positions = displays.map(function(m) {
+      return { name: m.name, x: m.x, y: m.y, width: m.width, height: m.height, refreshRate: m.refreshRate, scale: m.scale }
+    })
+    geometryNotices = ({})
     draft = result.workspaces.filter(function(w) { return w.id > 0 }).map(function(w) {
       return { id: w.id, name: w.name, windows: w.windows, source: w.monitor, target: w.monitor }
     }).sort(function(a, b) { return a.id - b.id })
@@ -303,29 +311,127 @@ Panel {
   function plan() {
     return { baseline: liveBaseline, uiScreen: panelScreen, positions: positions, workspaces: draft.filter(function(w) { return w.source !== w.target }).map(function(w) { return { id: w.id, source: w.source, target: w.target } }) }
   }
+  function logicalGeometry(display, position) {
+    if (!display || !position) return null
+    var rotated = display.transform % 2 !== 0
+    return {
+      width: Math.round((rotated ? position.height : position.width) / position.scale),
+      height: Math.round((rotated ? position.width : position.height) / position.scale)
+    }
+  }
+  function sameMode(a, b) {
+    return a && b && a.width === b.width && a.height === b.height
+      && Math.abs(a.refreshRate - b.refreshRate) <= 0.01
+  }
+  function modeValue(mode) {
+    return mode.width + "x" + mode.height + "@" + mode.refreshRate
+  }
+  function displayModeOptions(display) {
+    if (!display) return []
+    var options = display.modeOptions || []
+    if (options.some(function(option) { return sameMode(option, display) })) return options
+    return [{
+      value: modeValue(display),
+      label: display.width + " × " + display.height + " @ " + Number(display.refreshRate.toFixed(3)) + " Hz (current; not advertised)",
+      width: display.width, height: display.height, refreshRate: display.refreshRate
+    }].concat(options)
+  }
+  function modeOptionIndex(options, position) {
+    for (var i = 0; i < options.length; ++i) {
+      if (sameMode(options[i], position)) return i
+    }
+    return -1
+  }
+  function scaleFits(mode, scale) {
+    if (!mode || typeof scale !== "number" || !isFinite(scale) || scale < 0.1 || scale > 16) return false
+    var quantized = Math.round(scale * 120) / 120
+    var width = mode.width / quantized, height = mode.height / quantized
+    return Math.abs(scale - quantized) <= 0.000001
+      && width >= 1 && height >= 1
+      && Math.abs(width - Math.round(width)) <= 0.000001
+      && Math.abs(height - Math.round(height)) <= 0.000001
+  }
+  function displayScaleOptions(display, position) {
+    if (!display || !position) return []
+    var values = [1, 1.25, 1.5, 1.75, 2, 2.5, 3, 4].filter(function(scale) { return scaleFits(position, scale) })
+    if (scaleFits(position, display.scale) && values.indexOf(display.scale) < 0) values.push(display.scale)
+    if (values.indexOf(position.scale) < 0) values.push(position.scale)
+    return values.sort(function(a, b) { return a - b }).map(function(scale) {
+      return { value: scale, label: Number(scale.toFixed(6)) + "×" }
+    })
+  }
+  function scaleOptionIndex(options, position) {
+    if (!position) return -1
+    for (var i = 0; i < options.length; ++i) {
+      if (options[i].value === position.scale) return i
+    }
+    return -1
+  }
+  function editDisplayGeometry(fields, notice) {
+    if (!editable || !selectedPosition) return
+    positions = positions.map(function(p) { return p.name === selectedName ? Object.assign({}, p, fields) : p })
+    var notices = Object.assign({}, geometryNotices)
+    notices[selectedName] = notice
+    geometryNotices = notices
+    message = ""
+    messageIsError = false
+    topologyNotice = ""
+    changed()
+  }
+  function selectDisplayMode(value) {
+    if (!editable || !selectedDisplay || !selectedPosition || !(selectedDisplay.modeOptions || []).length) return
+    var option = selectedModeOptions.filter(function(choice) { return choice.value === value })[0]
+    if (!option) return
+    // Selecting the active mode preserves its exact refresh rate, not the rounded catalog rate.
+    var mode = sameMode(option, selectedDisplay) ? selectedDisplay : option
+    var scale = selectedPosition.scale
+    var notice = ""
+    if (!scaleFits(mode, scale)) {
+      scale = 1
+      notice = "Scale reset to 1× because the previous scale does not fit this resolution. Positions are unchanged; use relative placement to repair gaps or overlaps."
+    }
+    editDisplayGeometry({ width: mode.width, height: mode.height, refreshRate: mode.refreshRate, scale: scale }, notice)
+  }
+  function selectDisplayScale(scale) {
+    if (!editable || !selectedPosition || !scaleFits(selectedPosition, scale)
+        || !selectedScaleOptions.some(function(option) { return option.value === scale })) return
+    editDisplayGeometry({ scale: scale }, "")
+  }
+  function hasDisplayEdits() {
+    return liveBaseline && positions.some(function(p) {
+      var original = liveBaseline.monitors.filter(function(m) { return m.name === p.name })[0]
+      return !original || ["x", "y", "width", "height", "refreshRate", "scale"].some(function(field) {
+        return original[field] !== p[field]
+      })
+    })
+  }
   function changed() {
     revision++
     valid = false
+    changeCount = 0
     validationMessage = layoutBlocked ? "Layout changes are blocked until all enabled displays have usable geometry." : "Checking layout…"
     if (liveBaseline && !layoutBlocked && !trialActive && !refreshPending) validationTimer.restart()
   }
   function moveDisplay(name, x, y) {
     if (!editable) return
-    positions = positions.map(function(p) { return p.name === name ? { name: name, x: Math.round(x), y: Math.round(y) } : p })
+    positions = positions.map(function(p) { return p.name === name ? Object.assign({}, p, { x: Math.round(x), y: Math.round(y) }) : p })
     selectedName = name
     message = ""
+    messageIsError = false
     topologyNotice = ""
     changed()
   }
   function placeRelative(direction, reference) {
-    if (!selectedDisplay || !reference || reference.name === selectedName) return
+    if (!editable || !selectedDisplay || !selectedPosition || !reference || reference.name === selectedName) return
     var position = positions.filter(function(p) { return p.name === reference.name })[0]
     if (!position) return
+    var dimensions = logicalGeometry(selectedDisplay, selectedPosition)
+    var referenceDimensions = logicalGeometry(reference, position)
     var x = position.x, y = position.y
-    if (direction === "left") x -= selectedDisplay.logicalWidth
-    else if (direction === "right") x += reference.logicalWidth
-    else if (direction === "above") y -= selectedDisplay.logicalHeight
-    else y += reference.logicalHeight
+    if (direction === "left") x -= dimensions.width
+    else if (direction === "right") x += referenceDimensions.width
+    else if (direction === "above") y -= dimensions.height
+    else y += referenceDimensions.height
     moveDisplay(selectedName, x, y)
   }
   function stage(id, connector) {
@@ -385,11 +491,7 @@ Panel {
     if (action === "snapshot") {
       if (requestProcess.topologyRevision !== topologyRevision) return
       if (liveBaseline && snapshotSignature(liveBaseline) !== snapshotSignature(result)) {
-        var edited = draft.some(function(w) { return w.source !== w.target })
-          || positions.some(function(p) {
-            var original = liveBaseline.monitors.filter(function(m) { return m.name === p.name })[0]
-            return original && (original.x !== p.x || original.y !== p.y)
-          })
+        var edited = draft.some(function(w) { return w.source !== w.target }) || hasDisplayEdits()
         topologyNotice = edited ? "Displays changed. Pending edits were reset." : "Displays changed. Layout refreshed."
       }
       refreshPending = false
@@ -409,7 +511,7 @@ Panel {
     else if (action === "resume") {
       if (result.token && (root.opened || result.uiScreen === panelScreen)) {
         adoptSnapshot(result.baseline)
-        positions = result.plan.positions
+        positions = result.plan.positions.map(function(p) { return Object.assign({}, p) })
         draft = draft.map(function(w) {
           var move = result.plan.workspaces.filter(function(m) { return m.id === w.id })[0]
           return Object.assign({}, w, { target: move ? move.target : w.source })
@@ -644,6 +746,54 @@ Panel {
           }
           RowLayout {
             width: parent.width
+            spacing: Style.space(6)
+            Text { text: "Resolution"; color: Color.foreground; font.family: Style.font.family; font.pixelSize: Style.font.bodySmall }
+            ComboBox {
+              id: modePicker
+              objectName: "display-mode"
+              Layout.fillWidth: true
+              Layout.minimumWidth: 0
+              model: root.selectedModeOptions
+              textRole: "label"
+              valueRole: "value"
+              currentIndex: root.modeOptionIndex(model, root.selectedPosition)
+              enabled: root.editable && root.selectedPosition !== null && root.selectedDisplay !== null
+                && (root.selectedDisplay.modeOptions || []).length > 0
+              onActivated: function(index) {
+                var option = model[index]
+                if (option) root.selectDisplayMode(option.value)
+              }
+            }
+            Text { text: "Scale"; color: Color.foreground; font.family: Style.font.family; font.pixelSize: Style.font.bodySmall }
+            ComboBox {
+              id: scalePicker
+              objectName: "display-scale"
+              Layout.preferredWidth: Style.space(110)
+              model: root.selectedScaleOptions
+              textRole: "label"
+              valueRole: "value"
+              currentIndex: root.scaleOptionIndex(model, root.selectedPosition)
+              enabled: root.editable && root.selectedPosition !== null && count > 0
+              onActivated: function(index) {
+                var option = model[index]
+                if (option) root.selectDisplayScale(option.value)
+              }
+            }
+          }
+          Text {
+            objectName: "display-geometry-notice"
+            width: parent.width
+            visible: text !== ""
+            text: root.geometryNotices[root.selectedName] || (root.selectedDisplay && !(root.selectedDisplay.modeOptions || []).length
+              ? "No advertised modes. The current mode is preserved; resolution selection is unavailable." : "")
+            color: Color.foreground
+            font.family: Style.font.family
+            font.pixelSize: Style.font.bodySmall
+            textFormat: Text.PlainText
+            wrapMode: Text.WordWrap
+          }
+          RowLayout {
+            width: parent.width
             Text { text: "X"; color: Color.foreground; font.family: Style.font.family }
             SpinBox {
               objectName: "display-x"
@@ -660,13 +810,23 @@ Panel {
               enabled: root.editable && root.selectedPosition !== null
               onValueModified: root.moveDisplay(root.selectedName, root.selectedPosition.x, value)
             }
-            Item { Layout.fillWidth: true }
+            Text {
+              objectName: "display-logical-size"
+              Layout.fillWidth: true
+              text: root.selectedGeometry ? root.selectedGeometry.width + " × " + root.selectedGeometry.height + " logical pixels" : ""
+              color: Color.foreground
+              font.family: Style.font.family
+              font.pixelSize: Style.font.bodySmall
+              horizontalAlignment: Text.AlignRight
+              elide: Text.ElideRight
+            }
           }
           Flow {
             width: parent.width
             spacing: Style.space(5)
             ComboBox {
               id: referenceDisplay
+              objectName: "display-reference"
               model: root.displays.filter(function(m) { return m.name !== root.selectedName })
               textRole: "label"
               enabled: root.editable && count > 0
@@ -676,12 +836,22 @@ Panel {
               model: [ { label: "Left of", direction: "left" }, { label: "Right of", direction: "right" }, { label: "Above", direction: "above" }, { label: "Below", direction: "below" } ]
               delegate: Button {
                 required property var modelData
+                objectName: "display-place-" + modelData.direction
                 text: modelData.label
                 verticalPadding: Style.space(4)
                 enabled: root.editable && referenceDisplay.currentIndex >= 0
                 onClicked: root.placeRelative(modelData.direction, referenceDisplay.model[referenceDisplay.currentIndex])
               }
             }
+          }
+          Text {
+            objectName: "display-session-only"
+            width: parent.width
+            text: "Resolution, scale and layout changes are session-only. Preview before Apply; positions stay explicit."
+            color: Color.foreground
+            font.family: Style.font.family
+            font.pixelSize: Style.font.bodySmall
+            wrapMode: Text.WordWrap
           }
         }
         Item {
