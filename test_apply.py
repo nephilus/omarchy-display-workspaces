@@ -71,6 +71,48 @@ class LayoutSafetyTests(unittest.TestCase):
         return self.validate()
 
 
+    def test_empty_nonpersistent_workspace_can_expire_during_preview(self):
+        baseline = copy.deepcopy(self.current)
+        baseline["workspaces"].append({"id": 8, "monitor": "A", "windows": 0, "ispersistent": False})
+        self.current["workspaces"][0]["monitor"] = "B"
+        with self.compositor():
+            arrangement.verify_arrangement(baseline, self.plan["positions"],
+                                           [{"id": 1, "source": "A", "target": "B"}])
+        self.assertEqual(self.current["workspaces"], [{"id": 1, "monitor": "B"}])
+
+    def test_missing_populated_persistent_or_unknown_workspace_still_fails(self):
+        for metadata in ({"windows": 1, "ispersistent": False},
+                         {"windows": 0, "ispersistent": True}, {"windows": 0}, {}):
+            with self.subTest(metadata=metadata):
+                baseline = copy.deepcopy(self.current)
+                baseline["workspaces"].append({"id": 8, "monitor": "A", **metadata})
+                with self.compositor():
+                    with self.assertRaisesRegex(ValueError, "Workspace 8"):
+                        arrangement.verify_arrangement(baseline, self.plan["positions"], [])
+                    with self.assertRaisesRegex(ValueError, "Workspace 8 disappeared"):
+                        arrangement.move_workspace(baseline, 8, "B")
+
+    def test_surviving_empty_workspace_must_retain_its_display(self):
+        baseline = copy.deepcopy(self.current)
+        baseline["workspaces"].append({"id": 8, "monitor": "A", "windows": 0, "ispersistent": False})
+        self.current["workspaces"].append({"id": 8, "monitor": "B", "windows": 0, "ispersistent": False})
+        with self.compositor():
+            with self.assertRaisesRegex(ValueError, "Workspace 8"):
+                arrangement.verify_arrangement(baseline, self.plan["positions"], [])
+            with self.assertRaisesRegex(ValueError, "moved externally"):
+                arrangement.move_workspace(baseline, 8, "B", expected_source="A")
+
+    def test_expired_empty_workspace_is_not_recreated_by_move_or_rollback(self):
+        baseline = copy.deepcopy(self.current)
+        baseline["workspaces"].append({"id": 8, "monitor": "A", "windows": 0, "ispersistent": False})
+        before = copy.deepcopy(self.current)
+        with self.compositor():
+            arrangement.move_workspace(baseline, 8, "B", expected_source="A")
+            errors = arrangement.rollback({"baseline": baseline,
+                                           "plan": {"displayChanges": 0, "positions": self.plan["positions"]}})
+        self.assertEqual(errors, [])
+        self.assertEqual(self.current, before)
+
     def test_faulty_output_preserves_healthy_outputs_and_all_workspaces(self):
         self.raw[1]["width"] = 0
         self.raw.extend([{"name": "off", "disabled": True, "width": 0},
