@@ -4,7 +4,7 @@
 
 Omarchy Display Workspaces is a third-party Quickshell bar widget and compact display/workspace arrangement panel. Its public ID, QML module/IPC identity, and settings key are **`display.workspaces`**. Never use a developer username or homelab name as product identity. The `omarchy.*` namespace is first-party; `omarchy.workspaces` references that remain here identify the stock widget or upstream provenance.
 
-Keep the product narrow: multi-display workspace visibility, straightforward session arrangement, immediate presentation preferences, and deliberate configuration cleanup. Do not add profiles, resolution/HDR controls, dependencies, telemetry, or background services without a request.
+Keep the product narrow: multi-display workspace visibility, straightforward session arrangement with advertised resolution/refresh and scale controls, immediate presentation preferences, and deliberate configuration cleanup. Do not add profiles, rotation editing, HDR controls, dependencies, telemetry, or background services without a request.
 
 Read `README.md`, `docs/INSTALLATION.md`, and `docs/USAGE.md` before behavior changes. Follow `docs/AGENTS.md` when editing documentation or screenshots.
 
@@ -23,6 +23,7 @@ There is no build step. Reuse Omarchy's host QML components and Python's standar
 ## Safety invariants
 
 - **Preview/Apply is session-only.** Keep the 20-second confirmation deadline and independent rollback worker. Never silently persist layout changes.
+- Mode/scale edits belong to the same complete draft transaction as positions. Validate advertised modes and whole logical pixels; preserve the original timing for an unchanged custom mode. Rollback may restore original geometry only when the live geometry still matches the original or intended target; preserve unrelated external changes.
 - Names/icons/order save separately through native shell APIs. Preserve disconnected display preferences and unrelated settings.
 - **Forget is destructive.** Require immutable key/revision confirmation; back up changed files before atomic writes. Validate reload/configuration errors. Preserve concurrent external edits during recovery.
 - Keep preview and Forget mutually exclusive. Worker lifetime must not depend on the panel remaining alive.

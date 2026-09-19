@@ -2,7 +2,7 @@
 
 **See which workspaces belong to which display. Arrange them without a configuration detour.** A compact, no-frills widget and panel for the Omarchy Quickshell bar.
 
-**Plugin ID:** `display.workspaces` · **Version:** 2.0.0
+**Plugin ID:** `display.workspaces` · **Version:** 2.1.0
 
 A neutral third-party plugin ID: `display.workspaces`. The `omarchy.*` namespace is reserved for first-party plugins.
 
@@ -21,12 +21,12 @@ This plugin brings those tasks together: a per-display workspace overview in the
 
 | Area | What you get |
 | --- | --- |
-| **Display arrangement** | A visual map, coordinates, and left/right/above/below placement controls. Preview live changes for **20 seconds**, then explicitly Apply or let them revert. |
+| **Display arrangement** | A visual map, coordinates, and left/right/above/below placement controls, plus advertised resolution/refresh-rate selection and valid scale presets. Preview the complete draft live for **20 seconds**, then explicitly Apply or let it revert. |
 | **Workspace visibility** | Workspace groups per display, focus/visibility indicators, and a cursor-following display highlight. Move workspace cards between display columns. |
 | **Readable displays** | Your own names, curated Nerd Font icons, and presentation order; hotplug refresh without clearing those preferences. |
 | **Guardrails** | Independent rollback worker, stale-topology checks, and blocked layout actions when geometry is invalid. Healthy displays and workspace cards remain visible. |
 | **Deliberate cleanup** | Forget lists configured rules as well as saved customization, even for unnamed/disconnected displays. A second confirmation, file backups, and guarded recovery protect supported rule removal. |
-| **No frills** | Two compact tabs using Omarchy's native styling. No extra service to configure, Python packages to install, saved layout profiles, or resolution/HDR control panel. Transient systemd user workers handle operations. |
+| **No frills** | Two compact tabs using Omarchy's native styling. No extra service to configure, Python packages to install, saved layout profiles, or HDR control panel. Transient systemd user workers handle operations. |
 
 ### Design considerations
 
@@ -68,7 +68,7 @@ Real plugin UI rendered with **synthetic example displays/workspaces** on an opa
 
 ### Displays
 
-![Displays tab with a laptop and external display, a visual layout map, and relative-position controls](docs/images/displays.png)
+![Displays tab with synthetic displays, resolution and scale controls, and a draft layout map](docs/images/displays.png)
 
 ### Workspaces
 
@@ -80,11 +80,13 @@ Real plugin UI rendered with **synthetic example displays/workspaces** on an opa
 
 ## Important behavior
 
-**Apply keeps an arrangement for the current session only.** It does not write the arrangement into `monitors.lua`; there are no saved layout profiles. Names, icons, and display order save immediately in Omarchy's shell settings.
+**Apply keeps resolution, scale, and arrangement for the current session only.** It does not write them into `monitors.lua`; there are no saved layout profiles. Names, icons, and display order save immediately in Omarchy's shell settings.
 
 **Forget is a configuration edit, not merely hiding a display.** After a second confirmation, it removes the selected supported monitor rule and matching saved customization, backs up changed files, and reloads Hyprland when a rule changes. Removing an active rule can change its mode or layout immediately. It does not physically disconnect a monitor, and Hyprland may still detect it.
 
 Dynamic, broad, conditional, or ambiguous monitor rules are shown but cannot be removed automatically. Failed reloads trigger guarded restoration; concurrent external edits are preserved and reported for manual recovery.
+
+Version **2.1.0** adds native resolution/refresh-rate and scale drafts. Mode choices come from the connected display; scale choices must produce whole logical pixels. The map updates before Preview, but other display positions do not move automatically: repair gaps or overlaps with the placement controls. Rollback restores the original mode and scale as well as positions, unless hardware or external geometry changes make restoration unsafe.
 
 Read [usage, safety, and recovery](docs/USAGE.md) before changing monitor rules. Plugins execute unsandboxed code as your user: review code before installation.
 

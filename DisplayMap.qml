@@ -49,12 +49,13 @@ Item {
           break
         }
       }
+      var rotated = monitor.transform % 2 !== 0
       result.push({
         name: monitor.name,
         x: finiteOr(point.x, 0),
         y: finiteOr(point.y, 0),
-        width: Math.max(1, finiteOr(monitor.logicalWidth, 1)),
-        height: Math.max(1, finiteOr(monitor.logicalHeight, 1))
+        width: Math.max(1, Math.round(finiteOr(rotated ? point.height : point.width, 1) / finiteOr(point.scale, 1))),
+        height: Math.max(1, Math.round(finiteOr(rotated ? point.width : point.height, 1) / finiteOr(point.scale, 1)))
       })
     }
     return result

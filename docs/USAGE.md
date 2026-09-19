@@ -14,16 +14,22 @@ A unique hardware identity is preferred when matching saved settings after a con
 
 ## Session layout and workspace moves
 
-Use **Displays** to position outputs on the map or with position/relative-placement controls. Use **Workspaces** to move workspace cards between display columns.
+Use **Displays** to select a display on the map, choose its advertised resolution/refresh rate and scale, and position outputs on the map or with position/relative-placement controls. Use **Workspaces** to move workspace cards between display columns.
 
 1. Make the desired changes in the panel.
 2. Click **Preview (20s)**.
 3. Check the live result.
 4. Click **Apply** within the countdown to keep it, or cancel/wait to revert.
 
-Apply keeps the arrangement **for this session only**. It does not persist display positions or workspace bindings into Hyprland configuration. Reloading configuration or restarting the session can reapply your existing rules. The plugin does not provide profiles, resolution selection, or a replacement for a full monitor-settings application.
+Apply keeps resolution, scale, and arrangement **for this session only**. It does not persist display settings or workspace bindings into Hyprland configuration. Reloading configuration or restarting the session can reapply your existing rules. The plugin does not provide profiles, automatic mode/scale selection, custom modelines, rotation editing, or HDR controls.
 
-Preview uses an independent systemd user worker, so a recreated bar does not eliminate the rollback timer. It rejects stale hardware/topology and unsafe geometry. Recovery is best-effort if displays disconnect or their modes change: an unavailable physical display cannot always be restored automatically.
+Resolution choices come from the display's advertised modes. Refresh rates remain distinct, such as 59.94 Hz and 60 Hz. An active custom/unadvertised mode can be retained; if no modes are advertised, resolution selection is disabled rather than guessed.
+
+Scale presets are filtered against the selected resolution: both logical dimensions must be whole pixels and the scale must fit Hyprland's 1/120 increments. The current scale remains visible. If a different resolution cannot use the draft scale, it resets to 1× with a notice. The logical-size label and map reflect the draft, not a live change.
+
+Resizing a draft display leaves the other coordinates unchanged. Gaps, overlaps, and corner-only contact block Preview; use relative placement or drag outputs until their edges meet. Existing common-origin normalization translates the complete arrangement together when previewing.
+
+Preview uses an independent systemd user worker, so a recreated bar does not eliminate the rollback timer. It rejects stale hardware/topology, changed mode catalogs, and unsafe geometry. Cancel/expiry restores original modes, scales, and positions. Recovery is best-effort if a display disconnects, becomes unusable, or its geometry changes externally: the worker preserves unrelated external geometry instead of overwriting it, and reports incomplete recovery.
 
 When an output reports zero size or other invalid geometry, healthy displays and workspace cards remain visible. Names/icons/order and the configuration catalog remain accessible; unsafe layout actions stay blocked. This protects against bad geometry but does not fix the underlying driver, cable, or compositor problem.
 

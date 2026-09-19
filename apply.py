@@ -23,6 +23,7 @@ COORD_LIMIT = 32768
 TERMINAL = {"kept", "reverted", "failed"}
 IDENTITY = ("id", "name", "description", "make", "model", "serial")
 GEOMETRY = ("width", "height", "scale", "transform", "refreshRate", "disabled", "mirrorOf")
+POSITION = ("name", "x", "y", "width", "height", "refreshRate", "scale")
 SETTINGS = ("currentFormat", "colorManagementPreset", "sdrBrightness", "sdrSaturation",
             "sdrMinLuminance", "sdrMaxLuminance", "vrr")
 TOKEN_RE = re.compile(r"[0-9a-f]{48}\Z")
@@ -75,6 +76,56 @@ def indexed(items, key, label):
     return result
 
 
+def same_fields(before, after, keys):
+    for key in keys:
+        a, b = before.get(key), after.get(key)
+        if key in ("refreshRate", "scale") and isinstance(a, (int, float)) and isinstance(b, (int, float)):
+            tolerance = 0.010000001 if key == "refreshRate" else 0.000001
+            if not math.isfinite(a) or not math.isfinite(b) or abs(a - b) > tolerance:
+                return False
+        elif a != b:
+            return False
+    return True
+
+
+def mode_options(available):
+    options = {}
+    for text in available if isinstance(available, list) else []:
+        if not isinstance(text, str):
+            continue
+        match = re.fullmatch(r"(\d{1,5})x(\d{1,5})@(\d{1,4}(?:\.\d{1,6})?)(?:Hz)?", text.strip())
+        if not match:
+            continue
+        width, height, refresh = int(match[1]), int(match[2]), float(match[3])
+        if not 1 <= width <= 65536 or not 1 <= height <= 65536 or not 0 < refresh <= 1000:
+            continue
+        value = f"{width}x{height}@{refresh:.12g}"
+        options[value] = {"value": value, "label": f"{width} × {height} @ {refresh:.12g} Hz",
+                          "width": width, "height": height, "refreshRate": refresh}
+    return sorted(options.values(), key=lambda mode: (mode["width"], mode["height"], mode["refreshRate"]), reverse=True)
+
+
+def logical_size(position, transform):
+    scale = numeric(position.get("scale"), "display scale", 0.1, 16)
+    quantized = round(scale * 120) / 120
+    if abs(scale - quantized) > 0.000001:
+        raise ValueError("Display scale must use compositor 1/120 increments.")
+    width, height = position["width"] / quantized, position["height"] / quantized
+    if any(abs(value - round(value)) > 0.000001 or value < 1 for value in (width, height)):
+        raise ValueError("Display scale must produce integral logical pixel dimensions.")
+    return (round(height), round(width)) if transform % 2 else (round(width), round(height))
+
+
+def expected_outputs(baseline, positions):
+    targets = indexed(positions, "name", "display position")
+    monitors = []
+    for monitor in baseline["monitors"]:
+        expected = {**monitor, **targets.get(monitor["name"], {})}
+        expected["logicalWidth"], expected["logicalHeight"] = logical_size(expected, monitor["transform"])
+        monitors.append(expected)
+    return {**baseline, "monitors": monitors}
+
+
 def snapshot():
     outputs = query("monitors", "all")
     monitors, disabled, mirrors, unavailable = [], [], [], []
@@ -87,12 +138,13 @@ def snapshot():
             mirrors.append(monitor["name"])
             continue
         try:
-            width = numeric(monitor.get("width"), "display width", 1, 65536)
-            height = numeric(monitor.get("height"), "display height", 1, 65536)
+            width = numeric(monitor.get("width"), "display width", 1, 65536, True)
+            height = numeric(monitor.get("height"), "display height", 1, 65536, True)
             scale = numeric(monitor.get("scale"), "display scale", 0.1, 16)
             transform = numeric(monitor.get("transform"), "display rotation", 0, 7, True)
             numeric(monitor.get("x"), "display X coordinate", -COORD_LIMIT, COORD_LIMIT, True)
             numeric(monitor.get("y"), "display Y coordinate", -COORD_LIMIT, COORD_LIMIT, True)
+            numeric(monitor.get("refreshRate"), "display refresh rate", 0.001, 1000)
             if transform % 2:
                 width, height = height, width
             # Hyprland rounds transformed pixels divided by scale to logical pixels.
@@ -111,6 +163,7 @@ def snapshot():
             record["reason"] = f"Display geometry is unavailable: {error}"
             unavailable.append(record)
             continue
+        monitor["modeOptions"] = mode_options(monitor.get("availableModes"))
         monitors.append(monitor)
     return {"ok": True, "message": "Live layout loaded.", "monitors": monitors,
             "disabledMonitors": disabled, "mirroredOutputs": mirrors, "unavailableMonitors": unavailable,
@@ -127,7 +180,7 @@ def require_usable_outputs(*snapshots):
         raise ValueError(" ".join(unavailable.values()) + " Repair the output and refresh before arranging.")
 
 
-def compare_outputs(before, after, positions=True):
+def compare_outputs(before, after, catalog=False):
     require_usable_outputs(before, after)
     if before.get("session") != after.get("session"):
         raise ValueError("The compositor session changed. Refresh the panel.")
@@ -137,10 +190,12 @@ def compare_outputs(before, after, positions=True):
     new = indexed(after.get("monitors"), "name", "display")
     if not old or old.keys() != new.keys():
         raise ValueError("Connected displays changed. Refresh the panel.")
-    keys = IDENTITY + GEOMETRY + SETTINGS + (("x", "y") if positions else ())
+    keys = IDENTITY + GEOMETRY + SETTINGS + ("x", "y")
     for name, monitor in old.items():
-        if any(monitor.get(key) != new[name].get(key) for key in keys):
+        if not same_fields(monitor, new[name], keys):
             raise ValueError(f"Display {name} changed. Refresh the panel.")
+        if catalog and monitor.get("modeOptions", []) != new[name].get("modeOptions", []):
+            raise ValueError(f"Display {name} advertised modes changed. Refresh the panel.")
     old_disabled = indexed(before.get("disabledMonitors", []), "name", "disabled display")
     new_disabled = indexed(after.get("disabledMonitors", []), "name", "disabled display")
     if old_disabled.keys() != new_disabled.keys() or any(
@@ -158,10 +213,10 @@ def require_exact_rules(names):
                   'return package.loaded["hypr.monitors"], package.searchpath("hypr.monitors", package.path)'])
     parts = loaded.split("\t")
     if len(parts) != 2 or parts[0] != "true":
-        raise ValueError("Cannot establish exact monitor rules safely; position changes are unavailable.")
+        raise ValueError("Cannot establish exact monitor rules safely; display changes are unavailable.")
     rules = display_config.monitor_rules(Path(parts[1]).read_text())
     if any(rule["reason"] for rule in rules):
-        raise ValueError("Monitor rules must use plain exact connector declarations for safe position changes.")
+        raise ValueError("Monitor rules must use plain exact connector declarations for safe display changes.")
     outputs = {rule["selector"] for rule in rules}
     missing = set(names) - outputs
     if missing:
@@ -174,27 +229,44 @@ def validate(request, current=None):
     baseline = request["baseline"]
     live_validation = current is None
     current = snapshot() if current is None else current
-    monitors = compare_outputs(baseline, current)
+    monitors = compare_outputs(baseline, current, catalog=True)
     positions = indexed(request.get("positions"), "name", "display position")
     if positions.keys() != monitors.keys():
         raise ValueError("Provide exactly one position for every enabled display.")
-    normalized = []
+    normalized, sizes = [], {}
     for name, position in positions.items():
-        normalized.append({"name": name,
-                           "x": numeric(position.get("x"), "X coordinate", -COORD_LIMIT, COORD_LIMIT, True),
-                           "y": numeric(position.get("y"), "Y coordinate", -COORD_LIMIT, COORD_LIMIT, True)})
+        monitor = monitors[name]
+        target = {"name": name,
+                  "x": numeric(position.get("x"), "X coordinate", -COORD_LIMIT, COORD_LIMIT, True),
+                  "y": numeric(position.get("y"), "Y coordinate", -COORD_LIMIT, COORD_LIMIT, True),
+                  "width": numeric(position.get("width"), "display width", 1, 65536, True),
+                  "height": numeric(position.get("height"), "display height", 1, 65536, True),
+                  "refreshRate": numeric(position.get("refreshRate"), "display refresh rate", 0.001, 1000),
+                  "scale": numeric(position.get("scale"), "display scale", 0.1, 16)}
+        mode_keys = ("width", "height", "refreshRate")
+        if same_fields(monitor, target, mode_keys):
+            # Retain the exact active timing, including unadvertised custom modes.
+            target.update({key: monitor[key] for key in mode_keys})
+        else:
+            advertised = next((mode for mode in monitor["modeOptions"] if same_fields(mode, target, mode_keys)), None)
+            if advertised is None:
+                raise ValueError(f"Display {name}: requested mode is not advertised. Refresh the panel.")
+            target.update({key: advertised[key] for key in mode_keys})
+        sizes[name] = logical_size(target, monitor["transform"])
+        target["scale"] = round(target["scale"] * 120) / 120
+        normalized.append(target)
     min_x, min_y = min(p["x"] for p in normalized), min(p["y"] for p in normalized)
     for position in normalized:
         position["x"] -= min_x
         position["y"] -= min_y
-        monitor = monitors[position["name"]]
-        if position["x"] + monitor["logicalWidth"] > COORD_LIMIT or position["y"] + monitor["logicalHeight"] > COORD_LIMIT:
+        width, height = sizes[position["name"]]
+        if position["x"] + width > COORD_LIMIT or position["y"] + height > COORD_LIMIT:
             raise ValueError("The display layout is too large.")
     edges = {p["name"]: set() for p in normalized}
     for index, a in enumerate(normalized):
-        aw, ah = monitors[a["name"]]["logicalWidth"], monitors[a["name"]]["logicalHeight"]
+        aw, ah = sizes[a["name"]]
         for b in normalized[index + 1:]:
-            bw, bh = monitors[b["name"]]["logicalWidth"], monitors[b["name"]]["logicalHeight"]
+            bw, bh = sizes[b["name"]]
             dx = min(a["x"] + aw, b["x"] + bw) - max(a["x"], b["x"])
             dy = min(a["y"] + ah, b["y"] + bh) - max(a["y"], b["y"])
             if dx > 0 and dy > 0:
@@ -224,11 +296,11 @@ def validate(request, current=None):
         if source == target:
             raise ValueError("Include only changed workspace placements.")
         moves.append({"id": wid, "source": source, "target": target})
-    count = sum((p["x"], p["y"]) != (monitors[p["name"]]["x"], monitors[p["name"]]["y"]) for p in normalized)
+    count = sum(not same_fields(p, monitors[p["name"]], POSITION) for p in normalized)
     if count and live_validation:
         require_exact_rules(monitors)
     return {"ok": True, "positions": normalized, "workspaces": moves, "displayChanges": count,
-            "workspaceChanges": len(moves), "message": f"{count} display position(s), {len(moves)} workspace move(s)."}
+            "workspaceChanges": len(moves), "message": f"{count} display change(s), {len(moves)} workspace move(s)."}
 
 
 def runtime_dir():
@@ -341,7 +413,8 @@ def begin(request):
                 f"--unit=display-workspaces-arrange-{token}", "--property=Restart=on-failure",
                 "--property=RestartSec=1", "--property=StartLimitIntervalSec=0",
                 "--property=TimeoutStopSec=25", "--property=UMask=0077"]
-        for name in ("HYPRLAND_INSTANCE_SIGNATURE", "XDG_RUNTIME_DIR", "WAYLAND_DISPLAY", "PATH"):
+        for name in ("HOME", "XDG_CONFIG_HOME", "HYPRLAND_INSTANCE_SIGNATURE", "XDG_RUNTIME_DIR",
+                     "WAYLAND_DISPLAY", "PATH", "DBUS_SESSION_BUS_ADDRESS"):
             if name in os.environ:
                 args.append(f"--setenv={name}={os.environ[name]}")
         args.extend([sys.executable, str(Path(__file__).resolve()), "worker", token])
@@ -383,15 +456,16 @@ def monitor_guard(monitor):
     return (f"local m=hl.get_monitor({name}); "
             f"assert(m and m.id=={monitor['id']} and m.serial=={lua_string(monitor.get('serial', ''))} "
             f"and m.width=={monitor['width']} and m.height=={monitor['height']} "
-            f"and math.abs(m.scale-{monitor['scale']})<0.0001 and m.transform=={monitor['transform']} "
-            f"and math.abs(m.refresh_rate-{monitor['refreshRate']})<0.01 "
+            f"and m.x=={monitor['x']} and m.y=={monitor['y']} "
+            f"and math.abs(m.scale-{monitor['scale']})<=0.000001 and m.transform=={monitor['transform']} "
+            f"and math.abs(m.refresh_rate-{monitor['refreshRate']})<=0.010000001 "
             f"and not m.is_mirror, 'Display changed before mutation'); ")
 
 
 def set_positions(baseline, positions, force=False, recovery=False):
     current = snapshot()
     if not recovery:
-        require_usable_outputs(baseline, current)
+        compare_outputs(baseline, current, catalog=True)
     original = indexed(baseline["monitors"], "name", "display")
     live = indexed(current["monitors"], "name", "display")
     pieces = []
@@ -399,18 +473,19 @@ def set_positions(baseline, positions, force=False, recovery=False):
         old, now = original[position["name"]], live.get(position["name"])
         if now is None or not same_identity(old, now):
             raise ValueError(f"Display {old['name']} disconnected or was replaced.")
-        if any(old.get(key) != now.get(key) for key in GEOMETRY):
-            raise ValueError(f"Display {old['name']} changed mode; refusing an old rule.")
-        if not force and (now["x"], now["y"]) == (position["x"], position["y"]):
+        if not same_fields(old, now, GEOMETRY + ("x", "y")):
+            raise ValueError(f"Display {old['name']} changed geometry; refusing a stale rule.")
+        if not force and same_fields(now, position, POSITION):
             continue
         # 0.56.2 merges the existing exact-selector rule, preserving unexposed
         # ICC/HDR/VRR policy. Preflight rejects outputs without such a rule.
         fields = {"output": old["name"], "position": f"{position['x']}x{position['y']}",
-                  "mode": f"{old['width']}x{old['height']}@{old['refreshRate']:.5f}",
-                  "scale": old["scale"], "transform": old["transform"]}
+                  "mode": f"{position['width']}x{position['height']}@{position['refreshRate']}",
+                  "scale": position["scale"], "transform": old["transform"]}
         encoded = ','.join(f"{key}={lua_string(value) if isinstance(value, str) else value}" for key, value in fields.items())
-        pieces.append((monitor_guard(old), f"hl.monitor({{{encoded}}}); "))
+        pieces.append((monitor_guard(now), f"hl.monitor({{{encoded}}}); "))
     if pieces:
+        require_exact_rules(position["name"] for position in positions)
         # Preflight ALL outputs in the compositor before installing ANY rule.
         lua_eval(''.join("do " + guard + "end; " for guard, _ in pieces) + ''.join(code for _, code in pieces))
 
@@ -449,11 +524,13 @@ def restore_view(baseline, recovery=False):
             continue
         name = lua_string(monitor["name"])
         code.append(f"do local m=hl.get_monitor({name}); local w=hl.get_workspace({wid}); "
-                    f"if m and m.id=={monitor['id']} and w and w.monitor==m then m:set_workspace({{workspace={wid}}}) end end;")
+                    f"if m and m.id=={monitor['id']} and m.serial=={lua_string(monitor.get('serial', ''))} "
+                    f"and w and w.monitor==m then m:set_workspace({{workspace={wid}}}) end end;")
     focused = next((m for m in baseline["monitors"] if m.get("focused")), None)
     if focused:
         name = lua_string(focused["name"])
-        code.append(f"do local m=hl.get_monitor({name}); if m and m.id=={focused['id']} then hl.dispatch(hl.dsp.focus({{monitor=m}})) end end;")
+        code.append(f"do local m=hl.get_monitor({name}); if m and m.id=={focused['id']} "
+                    f"and m.serial=={lua_string(focused.get('serial', ''))} then hl.dispatch(hl.dsp.focus({{monitor=m}})) end end;")
     address = baseline.get("activeWindow", "")
     if re.fullmatch(r"0x[0-9a-fA-F]+", address):
         code.append(f"do local w=hl.get_window({lua_string('address:' + address)}); "
@@ -464,11 +541,7 @@ def restore_view(baseline, recovery=False):
 
 def verify_arrangement(baseline, positions, moves):
     current = snapshot()
-    monitors = compare_outputs(baseline, current, positions=False)
-    for position in positions:
-        actual = monitors[position["name"]]
-        if (actual["x"], actual["y"]) != (position["x"], position["y"]):
-            raise ValueError(f"Display {position['name']} did not reach the requested position.")
+    compare_outputs(expected_outputs(baseline, positions), current)
     workspaces = indexed(current["workspaces"], "id", "workspace")
     expected = {w["id"]: w["monitor"] for w in baseline["workspaces"] if w["id"] > 0}
     expected.update({move["id"]: move["target"] for move in moves})
@@ -494,18 +567,25 @@ def rollback(state):
     # Restore surviving compatible outputs together. Separate IPC evaluations
     # expose intermediate layouts that can overlap even when both endpoints do not.
     try:
-        live = indexed(snapshot()["monitors"], "name", "display")
+        current = snapshot()
+        if baseline.get("session") != current.get("session"):
+            return ["The compositor session changed; refusing to restore an old arrangement."]
+        live = indexed(current["monitors"], "name", "display")
+        targets = indexed(expected_outputs(baseline, state["plan"]["positions"])["monitors"], "name", "display")
         positions = []
         for monitor in baseline["monitors"]:
             now = live.get(monitor["name"])
             if now is None or not same_identity(monitor, now):
                 errors.append(f"Display {monitor['name']} disconnected or was replaced.")
-            elif any(monitor.get(key) != now.get(key) for key in GEOMETRY):
-                errors.append(f"Display {monitor['name']} changed mode; refusing an old rule.")
+            elif not any(same_fields(expected, now, GEOMETRY + ("x", "y"))
+                         for expected in (monitor, targets[monitor["name"]])):
+                errors.append(f"Display {monitor['name']} changed externally; preserving its geometry.")
             else:
-                positions.append({"name": monitor["name"], "x": monitor["x"], "y": monitor["y"]})
-        if positions:
-            set_positions(baseline, positions, force=bool(state["plan"]["displayChanges"]), recovery=True)
+                positions.append({key: monitor[key] for key in POSITION})
+        if positions and state["plan"]["displayChanges"]:
+            # Guard the observed mixture of before/after states: a failed batch or
+            # restarted worker may have installed only some complete monitor rules.
+            set_positions(current, positions, force=True, recovery=True)
     except Exception as error:
         errors.append(str(error))
     # Moving an active workspace may also move/create a replacement. Restore all
@@ -521,7 +601,7 @@ def rollback(state):
         restore_view(baseline, recovery=True)
     except Exception as error:
         errors.append(f"Focus restoration: {error}")
-    positions = [{"name": m["name"], "x": m["x"], "y": m["y"]} for m in baseline["monitors"]]
+    positions = [{key: monitor[key] for key in POSITION} for monitor in baseline["monitors"]]
     moves = [{"id": w["id"], "target": w["monitor"]} for w in baseline["workspaces"] if w["id"] > 0]
     try:
         settle(baseline, positions, moves)
