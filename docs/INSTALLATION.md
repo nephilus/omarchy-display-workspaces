@@ -81,6 +81,14 @@ Do not enable a second empty entry or remove the old settings before preserving 
 
 Version 2.1 adds session-only resolution/refresh-rate and scale controls without changing the plugin ID or saved presentation settings. Finish or revert any active preview before updating: the worker and panel now exchange complete draft geometry. Existing supported exact connector rules are still required for display changes. No new package, profile store, or background service is installed.
 
+## Upgrading from 2.1
+
+Version 2.2 adds a **Profiles** tab without changing the plugin ID or presentation settings. Finish or revert active previews and wait for Forget to finish before updating: draft geometry now includes rotation for profile restoration. Restart the shell if the new tab is cached out.
+
+There is no migration or automatic profile creation. **Save current (new)** creates the store at `$XDG_CONFIG_HOME/display-workspaces/profiles.json` (normally `~/.config/display-workspaces/profiles.json`). It captures live geometry and workspace placement, not existing configuration rules or untested draft edits. No package or background service is added. Profiles load manually into the existing session-only preview flow.
+
+The Profiles footer contains its own save/replace/delete/load actions and Cancel; Preview/Apply remain on Displays and Workspaces. This update also removes control recreation and temporary loading-row shifts when changing workspace display icons. Existing layout drafts and unrelated unfinished name edits stay intact.
+
 ## Updating
 
 For a native Git-managed installation:
@@ -116,6 +124,8 @@ omarchy plugin remove display.workspaces
 
 For a development symlink, disable the plugin and remove only the symlink manually if you want to retain the source checkout. Back up settings before removal. Uninstalling does not undo monitor-rule changes previously confirmed with Forget; use the transaction backups described in [recovery](USAGE.md#recovery).
 
+Saved profiles and their backups are outside the plugin directory and remain after uninstall. Archive or delete that profile directory separately only if you no longer want them; removing it is not required to restore the stock widget.
+
 ## Troubleshooting
 
 ```bash
@@ -128,5 +138,6 @@ omarchy-shell shell ping
 - **Unknown plugin command or missing host imports:** the installed Omarchy generation lacks this plugin API. Use a compatible Omarchy/Quickshell setup; copying the files into Waybar will not work.
 - **Duplicate plugin ID:** an existing `display.workspaces` installation must be migrated or updated, not installed a second time.
 - **Preview unavailable:** inspect the panel's reason. Geometry must be valid, the systemd user manager must work, and display changes require supported exact monitor declarations in the loaded `hypr.monitors` module. Refresh after a mode catalog changes; repair draft gaps/overlaps after changing resolution or scale.
+- **Profile unavailable:** all enabled displays must match without contradictory identities, and the saved mode/scale/layout must remain valid. Missing saved workspaces are skipped rather than recreated. Read the compatibility reason; Detect displays refreshes it. A malformed, newer-version, or unsafe store requires manual review, not resetting it blindly.
 - **Forget disabled:** dynamic/broad rules, ambiguous hardware identity, unsafe file ownership/permissions, or a stale catalog prevent destructive edits. Review the reason instead of bypassing it.
 - **Missing icons:** use the Nerd Font configured by Omarchy.

@@ -8,6 +8,8 @@ Right-click a display label to open the arrangement panel. The green display hig
 
 In **Workspaces**, edit a display's name or choose a curated Nerd Font icon. Use the ordering controls to change the presentation order. These preferences save immediately in the `display.workspaces` bar entry in `~/.config/omarchy/shell.json`; they do not require Preview or Apply.
 
+Name and icon changes update the existing workspace controls in place, preserving draft workspace moves and unfinished edits in other display-name fields. Background catalog refreshes do not insert a temporary loading row once the catalog is available.
+
 A unique hardware identity is preferred when matching saved settings after a connector changes. Connector names are the fallback. Disconnected displays retain their saved settings until explicitly forgotten.
 
 **Detect displays** refreshes discovery without clearing saved names, icons, or ordering. Hotplug events also refresh the models.
@@ -21,7 +23,7 @@ Use **Displays** to select a display on the map, choose its advertised resolutio
 3. Check the live result.
 4. Click **Apply** within the countdown to keep it, or cancel/wait to revert.
 
-Apply keeps resolution, scale, and arrangement **for this session only**. It does not persist display settings or workspace bindings into Hyprland configuration. Reloading configuration or restarting the session can reapply your existing rules. The plugin does not provide profiles, automatic mode/scale selection, custom modelines, rotation editing, or HDR controls.
+Apply keeps resolution, scale, rotation, and arrangement **for this session only**. It does not persist display settings or workspace bindings into Hyprland configuration. Reloading configuration or restarting the session can reapply your existing rules. Profiles are saved separately and never load automatically. The plugin does not provide automatic mode/scale selection, custom modelines, rotation editing, or HDR controls.
 
 Resolution choices come from the display's advertised modes. Refresh rates remain distinct, such as 59.94 Hz and 60 Hz. An active custom/unadvertised mode can be retained; if no modes are advertised, resolution selection is disabled rather than guessed.
 
@@ -29,9 +31,41 @@ Scale presets are filtered against the selected resolution: both logical dimensi
 
 Resizing a draft display leaves the other coordinates unchanged. Gaps, overlaps, and corner-only contact block Preview; use relative placement or drag outputs until their edges meet. Existing common-origin normalization translates the complete arrangement together when previewing.
 
-Preview uses an independent systemd user worker, so a recreated bar does not eliminate the rollback timer. It rejects stale hardware/topology, changed mode catalogs, and unsafe geometry. Cancel/expiry restores original modes, scales, and positions. Recovery is best-effort if a display disconnects, becomes unusable, or its geometry changes externally: the worker preserves unrelated external geometry instead of overwriting it, and reports incomplete recovery.
+Preview uses an independent systemd user worker, so a recreated bar does not eliminate the rollback timer. It rejects stale hardware/topology, changed mode catalogs, and unsafe geometry. Cancel/expiry restores original modes, scales, rotations, and positions. Recovery is best-effort if a display disconnects, becomes unusable, or its geometry changes externally: the worker preserves unrelated external geometry instead of overwriting it, and reports incomplete recovery.
 
 When an output reports zero size or other invalid geometry, healthy displays and workspace cards remain visible. Names/icons/order and the configuration catalog remain accessible; unsafe layout actions stay blocked. This protects against bad geometry but does not fix the underlying driver, cable, or compositor problem.
+
+## Manual profiles
+
+A profile is a named snapshot of the **current live arrangement**, not a saved draft or an automatic rule. It records all enabled displays' hardware identities, resolution/refresh rate, scale, rotation, coordinates, and positive workspace IDs with their display placements. Names, icons, and bar order remain separate presentation preferences.
+
+1. Arrange the live session as desired. If you edited a draft, Preview and Apply it first, then reopen the panel.
+2. Open **Profiles**, enter a unique name (up to 80 characters), and click **Save current (new)**. Saving never applies draft edits.
+3. Later, select that profile and check its compatibility message. Click **Load into draft**. If you have display or workspace draft edits, confirm discarding them—or cancel to preserve them.
+4. Review the loaded Displays map and Workspaces cards, then **Preview (20s) → Apply**. Loading alone changes neither live displays nor files.
+
+The **Profiles** footer contains Save current, Replace selected, Delete selected, Load into draft, and Cancel instead of Preview/Apply. During confirmation it shows the confirmation action and Cancel; Cancel dismisses the confirmation without closing the panel. Preview/Apply remain on Displays and Workspaces.
+
+**Replace selected** captures the current live arrangement again, optionally under the edited name. It is not a rename-only operation. **Delete selected** removes only that saved profile. Both require a second confirmation tied to the selected profile and store revision. Neither changes live displays or the existing draft. Preview and Forget must finish before saving, replacing, deleting, or loading a profile.
+
+### Matching and limits
+
+- A unique make/model/serial identity survives HDMI/DP/USB-C connector renaming. The entire enabled display combination must match: missing or extra displays block loading.
+- Unique make/model identities without serials are explicitly marked **port-dependent / weak**. Duplicate or unknown identities require the remembered connector, without contradictory hardware information. Different nonempty serials on the same connector never match. Verify weak matches physically before Preview.
+- Missing saved workspace IDs are skipped with a message; newly created live workspaces keep their current placement. Profiles do not create or pin workspaces.
+- Unavailable modes, unsafe scales/layouts, disabled or mirrored outputs, and unusable geometry block saving or loading as applicable. An unadvertised custom mode can only be retained while it is already active.
+- Stored rotations are restored through the same preview transaction; there is no rotation editor. Loading normalizes the common origin without changing relative positions.
+- A hardware match does not bypass Preview's rule preflight: live display changes still require supported exact connector rules in the loaded `hypr.monitors` module, including after port renaming.
+
+Unavailable profiles stay listed with a reason and can be deleted without matching that display combination. Use **Detect displays** after an external display or configuration change. No automatic selection, hotplug application, login restoration, or new background service is added.
+
+### Storage and profile recovery
+
+Profiles live in `$XDG_CONFIG_HOME/display-workspaces/profiles.json`, defaulting to `~/.config/display-workspaces/profiles.json`. The versioned file contains monitor serials and workspace IDs; treat it and its backups as private configuration, not shareable examples.
+
+Changes to an existing store first back up its exact bytes beside it as `profiles.json.profile-<random-token>.bak`, then atomically replace the store. Feedback reports backup paths. Ownership, permissions, symlinks, schema version, and revision are checked; malformed or newer-version files are refused rather than overwritten. Profile operations use a separate store lock across compositor sessions. Do not manually edit the store while an operation is running: guards detect observed external edits, but arbitrary editors do not participate in the lock.
+
+For manual recovery, close the panel, preserve the current file, and compare a backup before restoring or merging it. Restoring the whole file can erase profiles saved later. Reopen the panel or use Detect displays afterward. No Hyprland reload is needed. Profile backups are not automatically pruned. Forget and uninstall do not remove profiles or their backups.
 
 ## Forget display
 
@@ -80,4 +114,4 @@ To recover manually:
 4. After restoring Lua rules, run `hyprctl reload`, then `hyprctl configerrors` and check that no errors remain.
 5. Shell settings normally reload automatically; use `omarchy restart shell` if the UI remains stale.
 
-Do not restore unrelated workstation configuration from someone else's example or backup. This repository intentionally contains no personal `shell.json`, `monitors.lua`, monitor serial numbers, or desktop screenshots.
+Do not restore unrelated workstation configuration from someone else's example or backup. This repository intentionally contains no personal `shell.json`, `monitors.lua`, real monitor serial numbers, or desktop screenshots.

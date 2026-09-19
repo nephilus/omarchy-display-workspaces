@@ -285,6 +285,26 @@ class LayoutSafetyTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "overlap"):
             self.validate()
 
+    def test_profile_rotation_changes_geometry_and_rolls_back(self):
+        self.plan["positions"][0]["transform"] = 1
+        with self.assertRaisesRegex(ValueError, "share an edge"):
+            self.validate()
+        self.plan["positions"][1]["x"] = 800
+        plan = self.validate()
+        baseline = self.plan["baseline"]
+        with self.compositor():
+            arrangement.set_positions(baseline, plan["positions"])
+            arrangement.verify_arrangement(baseline, plan["positions"], [])
+            self.assertEqual(self.current["monitors"][0]["transform"], 1)
+            self.assertEqual(self.current["monitors"][0]["logicalWidth"], 800)
+            self.assertEqual(arrangement.rollback({"baseline": baseline, "plan": plan}), [])
+        self.assertEqual(self.current["monitors"], baseline["monitors"])
+
+    def test_invalid_profile_rotation_is_rejected_before_mutation(self):
+        self.plan["positions"][0]["transform"] = 8
+        with self.assertRaisesRegex(ValueError, "rotation"):
+            self.validate()
+
     def test_unadvertised_mode_and_changed_catalog_are_rejected(self):
         self.plan["positions"][0]["refreshRate"] = 120
         with self.assertRaisesRegex(ValueError, "not advertised"):

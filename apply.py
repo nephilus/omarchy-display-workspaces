@@ -17,13 +17,14 @@ import sys
 import time
 
 import configuration as display_config
+import profiles as display_profiles
 
 CONFIRM_SECONDS = 20
 COORD_LIMIT = 32768
 TERMINAL = {"kept", "reverted", "failed"}
 IDENTITY = ("id", "name", "description", "make", "model", "serial")
 GEOMETRY = ("width", "height", "scale", "transform", "refreshRate", "disabled", "mirrorOf")
-POSITION = ("name", "x", "y", "width", "height", "refreshRate", "scale")
+POSITION = ("name", "x", "y", "width", "height", "refreshRate", "scale", "transform")
 SETTINGS = ("currentFormat", "colorManagementPreset", "sdrBrightness", "sdrSaturation",
             "sdrMinLuminance", "sdrMaxLuminance", "vrr")
 TOKEN_RE = re.compile(r"[0-9a-f]{48}\Z")
@@ -121,7 +122,7 @@ def expected_outputs(baseline, positions):
     monitors = []
     for monitor in baseline["monitors"]:
         expected = {**monitor, **targets.get(monitor["name"], {})}
-        expected["logicalWidth"], expected["logicalHeight"] = logical_size(expected, monitor["transform"])
+        expected["logicalWidth"], expected["logicalHeight"] = logical_size(expected, expected["transform"])
         monitors.append(expected)
     return {**baseline, "monitors": monitors}
 
@@ -242,7 +243,8 @@ def validate(request, current=None):
                   "width": numeric(position.get("width"), "display width", 1, 65536, True),
                   "height": numeric(position.get("height"), "display height", 1, 65536, True),
                   "refreshRate": numeric(position.get("refreshRate"), "display refresh rate", 0.001, 1000),
-                  "scale": numeric(position.get("scale"), "display scale", 0.1, 16)}
+                  "scale": numeric(position.get("scale"), "display scale", 0.1, 16),
+                  "transform": numeric(position.get("transform"), "display rotation", 0, 7, True)}
         mode_keys = ("width", "height", "refreshRate")
         if same_fields(monitor, target, mode_keys):
             # Retain the exact active timing, including unadvertised custom modes.
@@ -252,7 +254,7 @@ def validate(request, current=None):
             if advertised is None:
                 raise ValueError(f"Display {name}: requested mode is not advertised. Refresh the panel.")
             target.update({key: advertised[key] for key in mode_keys})
-        sizes[name] = logical_size(target, monitor["transform"])
+        sizes[name] = logical_size(target, target["transform"])
         target["scale"] = round(target["scale"] * 120) / 120
         normalized.append(target)
     min_x, min_y = min(p["x"] for p in normalized), min(p["y"] for p in normalized)
@@ -481,7 +483,7 @@ def set_positions(baseline, positions, force=False, recovery=False):
         # ICC/HDR/VRR policy. Preflight rejects outputs without such a rule.
         fields = {"output": old["name"], "position": f"{position['x']}x{position['y']}",
                   "mode": f"{position['width']}x{position['height']}@{position['refreshRate']}",
-                  "scale": position["scale"], "transform": old["transform"]}
+                  "scale": position["scale"], "transform": position["transform"]}
         encoded = ','.join(f"{key}={lua_string(value) if isinstance(value, str) else value}" for key, value in fields.items())
         pieces.append((monitor_guard(now), f"hl.monitor({{{encoded}}}); "))
     if pieces:
@@ -703,7 +705,7 @@ def require_no_preview(root):
         previous = load(root, json.loads(active.read_text())["token"])
         expire_unstarted(root, previous)
         if previous["state"] not in TERMINAL:
-            raise ValueError("An arrangement preview is active. Keep it or wait for rollback before forgetting a display.")
+            raise ValueError("An arrangement preview is active. Keep it or wait for rollback before another operation.")
 
 
 def require_no_forget(root):
@@ -792,6 +794,19 @@ def main():
         return snapshot()
     if command == "configuration" and len(sys.argv) == 2:
         return display_config.configuration(sys.modules[__name__])
+    if command == "profiles" and len(sys.argv) == 2:
+        return display_profiles.catalog(sys.modules[__name__])
+    if command in ("profile-save", "profile-delete", "profile-load") and len(sys.argv) == 3:
+        if len(sys.argv[2]) > 1048576:
+            raise ValueError("Profile request is too large.")
+        request = json.loads(sys.argv[2], object_pairs_hook=display_config.strict_object)
+        operation = {"profile-save": display_profiles.save, "profile-delete": display_profiles.delete,
+                     "profile-load": display_profiles.load}[command]
+        root = runtime_dir()
+        with locked(root):
+            require_no_preview(root)
+            require_no_forget(root)
+            return operation(sys.modules[__name__], request)
     if command == "forget" and len(sys.argv) == 3:
         if len(sys.argv[2]) > 1048576:
             raise ValueError("Forget request is too large.")
