@@ -89,6 +89,12 @@ There is no migration or automatic profile creation. **Save current (new)** crea
 
 The Profiles footer contains its own save/replace/delete/load actions and Cancel; Preview/Apply remain on Displays and Workspaces. This update also removes control recreation and temporary loading-row shifts when changing workspace display icons. Existing layout drafts and unrelated unfinished name edits stay intact.
 
+## Upgrading from 2.2.0
+
+Version 2.2.1 fixes previews and recovery failing when Hyprland retires an empty, nonpersistent replacement workspace after a display reconnect or workspace/focus change. Surviving workspaces still require the intended placement; populated/persistent workspaces and unknown lifecycle metadata remain strictly checked.
+
+Finish or revert active previews and wait for Forget to finish before updating. No profile, settings, or plugin-ID migration is required. Existing profiles remain compatible; the update does not load or apply them automatically.
+
 ## Updating
 
 For a native Git-managed installation:
