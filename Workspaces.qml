@@ -151,7 +151,7 @@ BarWidget {
       var index = entries.indexOf(displaySettings(m))
       if (index >= 0) ranks[m.name] = index
     })
-    displayRanks = ranks
+    if (JSON.stringify(displayRanks) !== JSON.stringify(ranks)) displayRanks = ranks
   }
   onSettingsChanged: refreshDisplayOrder()
   Component.onCompleted: {

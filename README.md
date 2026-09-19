@@ -2,7 +2,7 @@
 
 **See which workspaces belong to which display. Arrange them without a configuration detour.** A compact, no-frills widget and panel for the Omarchy Quickshell bar.
 
-**Plugin ID:** `display.workspaces` · **Version:** 2.1.0
+**Plugin ID:** `display.workspaces` · **Version:** 2.2.0
 
 A neutral third-party plugin ID: `display.workspaces`. The `omarchy.*` namespace is reserved for first-party plugins.
 
@@ -15,7 +15,7 @@ Two everyday multi-monitor tasks should not be unnecessarily complicated:
 - **Displays:** moving a screen to the other side should not require hand-editing coordinates or navigating a full settings application. Applying a layout without a confirmation/rollback path can leave you trying to recover an unusable arrangement.
 - **Workspaces:** a flat workspace list does not make it obvious which screen owns each workspace, which ones are visible, or where to move one.
 
-This plugin brings those tasks together: a per-display workspace overview in the bar and a small, right-click arrangement panel. No profiles, setup wizard, or sprawling control center.
+This plugin brings those tasks together: a per-display workspace overview in the bar and a small, right-click arrangement panel. Named profiles recall familiar setups manually, without a setup wizard or automatic switching.
 
 ## What makes it different
 
@@ -24,14 +24,15 @@ This plugin brings those tasks together: a per-display workspace overview in the
 | **Display arrangement** | A visual map, coordinates, and left/right/above/below placement controls, plus advertised resolution/refresh-rate selection and valid scale presets. Preview the complete draft live for **20 seconds**, then explicitly Apply or let it revert. |
 | **Workspace visibility** | Workspace groups per display, focus/visibility indicators, and a cursor-following display highlight. Move workspace cards between display columns. |
 | **Readable displays** | Your own names, curated Nerd Font icons, and presentation order; hotplug refresh without clearing those preferences. |
+| **Manual profiles** | Save the current live display/workspace arrangement by name. Match physical displays across connector changes, load a draft, then use the same Preview/Apply flow. Replacing or deleting a profile requires confirmation. |
 | **Guardrails** | Independent rollback worker, stale-topology checks, and blocked layout actions when geometry is invalid. Healthy displays and workspace cards remain visible. |
 | **Deliberate cleanup** | Forget lists configured rules as well as saved customization, even for unnamed/disconnected displays. A second confirmation, file backups, and guarded recovery protect supported rule removal. |
-| **No frills** | Two compact tabs using Omarchy's native styling. No extra service to configure, Python packages to install, saved layout profiles, or HDR control panel. Transient systemd user workers handle operations. |
+| **No frills** | Three compact tabs using Omarchy's native styling. No extra service to configure, Python packages to install, automatic profile switching, or HDR control panel. Transient systemd user workers handle operations. |
 
 ### Design considerations
 
 - **Separate presentation from geometry.** Names, icons, and ordering save immediately; live arrangement changes require Preview and Apply.
-- **Make persistence explicit.** Apply is **session-only**. Forget is a separate, persistent configuration edit—not a way to hide or disable hardware.
+- **Make persistence explicit.** Apply is **session-only**. Save current persists a named snapshot, not live compositor rules. Forget is a separate, persistent configuration edit—not a way to hide or disable hardware.
 - **Fail closed rather than guess.** Unsupported rules, ambiguous identities, bad geometry, and stale confirmations are refused with a reason.
 - **Keep recovery outside the panel.** A bar recreation should not remove the rollback timer. Restoration still depends on the displays and compositor remaining usable.
 - **Keep the scope narrow.** This is a workspace overview and arrangement tool, not a replacement for every monitor setting.
@@ -74,19 +75,25 @@ Real plugin UI rendered with **synthetic example displays/workspaces** on an opa
 
 ![Workspaces tab with named display columns, icons, workspace cards, and the configured-display selector](docs/images/workspaces.png)
 
+### Profiles
+
+![Profiles tab with a saved live arrangement, hardware compatibility status, and explicit save, replace, delete, and load controls](docs/images/profiles.png)
+
 ### Confirmed rule removal
 
 ![Forget confirmation for an unnamed, disconnected monitor rule, including its backup and reconnection warning](docs/images/forget-display.png)
 
 ## Important behavior
 
-**Apply keeps resolution, scale, and arrangement for the current session only.** It does not write them into `monitors.lua`; there are no saved layout profiles. Names, icons, and display order save immediately in Omarchy's shell settings.
+**Apply keeps resolution, scale, rotation, and arrangement for the current session only.** It does not write them into `monitors.lua`. **Profiles → Save current (new)** separately saves the live arrangement; loading a profile only prepares a draft. Nothing switches automatically. Names, icons, and display order save immediately in Omarchy's shell settings and are not part of profiles.
 
 **Forget is a configuration edit, not merely hiding a display.** After a second confirmation, it removes the selected supported monitor rule and matching saved customization, backs up changed files, and reloads Hyprland when a rule changes. Removing an active rule can change its mode or layout immediately. It does not physically disconnect a monitor, and Hyprland may still detect it.
 
 Dynamic, broad, conditional, or ambiguous monitor rules are shown but cannot be removed automatically. Failed reloads trigger guarded restoration; concurrent external edits are preserved and reported for manual recovery.
 
-Version **2.1.0** adds native resolution/refresh-rate and scale drafts. Mode choices come from the connected display; scale choices must produce whole logical pixels. The map updates before Preview, but other display positions do not move automatically: repair gaps or overlaps with the placement controls. Rollback restores the original mode and scale as well as positions, unless hardware or external geometry changes make restoration unsafe.
+Version **2.2.0** adds manual profiles: live display geometry and existing positive workspace placements, hardware-first matching, guarded storage, and confirmed replacement/deletion. Missing or changed displays, ambiguous identities, unavailable modes, and unsafe geometry block loading rather than guessing. Profiles preserve rotation but do not add a rotation editor. See the [profile workflow and limits](docs/USAGE.md#manual-profiles).
+
+The Profiles footer shows Save/Replace/Delete/Load and Cancel instead of Preview/Apply, with confirmation actions in the same row. Workspace name/icon updates retain the existing controls and drafts; background catalog refreshes no longer add a temporary loading row.
 
 Read [usage, safety, and recovery](docs/USAGE.md) before changing monitor rules. Plugins execute unsandboxed code as your user: review code before installation.
 
@@ -98,7 +105,7 @@ Coding agents must read [AGENTS.md](AGENTS.md) first. Documentation and screensh
 git clone https://github.com/nephilus/omarchy-display-workspaces.git
 cd omarchy-display-workspaces
 omarchy plugin validate .
-python3 -m unittest test_apply test_configuration
+python3 -m unittest test_apply test_configuration test_profiles
 ```
 
 There is no build step or Python package installation. The Python backend uses the standard library. Backend regression tests use synthetic data and temporary files; they do not rearrange your real displays.
@@ -107,6 +114,7 @@ There is no build step or Python package installation. The Python backend uses t
 - `ArrangePanel.qml`, `ArrangePopup.qml`, `DisplayMap.qml`: native arrangement UI.
 - `apply.py`: discovery, validation, session preview/rollback, and detached workers.
 - `configuration.py`: nonexecuting Lua rule discovery, merged catalog, guarded configuration edits and recovery.
+- `profiles.py`: guarded named snapshots, hardware matching, and draft-only profile loading.
 
 ## License and credits
 

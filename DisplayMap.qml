@@ -49,7 +49,7 @@ Item {
           break
         }
       }
-      var rotated = monitor.transform % 2 !== 0
+      var rotated = point.transform % 2 !== 0
       result.push({
         name: monitor.name,
         x: finiteOr(point.x, 0),

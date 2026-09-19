@@ -2,9 +2,9 @@
   "schemaVersion": 1,
   "id": "display.workspaces",
   "name": "Omarchy Display Workspaces",
-  "version": "2.1.0",
+  "version": "2.2.0",
   "author": "nephilus (based on Omarchy)",
-  "description": "Display workspace groups with safe session-only resolution, scale, and layout previews",
+  "description": "Display workspace groups, manual profiles, and session-only layout previews",
   "kinds": [
     "bar-widget"
   ],
@@ -13,7 +13,7 @@
   },
   "barWidget": {
     "displayName": "Display Workspaces",
-    "description": "The green display highlight follows the cursor. Displays update automatically when connected or disconnected; Detect displays reloads the current layout without clearing saved names, icons, or ordering. Faulty outputs are reported separately without hiding healthy displays or workspace cards; unsafe layout changes stay blocked until usable modes recover. Right-click a display for compact, translucent Displays and Workspaces tabs. Rename, choose a curated Nerd Font icon, and reorder columns in Workspaces; presentation preferences save immediately. Forget display lists configured monitor rules and saved preferences, including entries without custom names or icons. Confirmation removes the selected exact monitor rule and matching preferences, backs up changed files, and reloads Hyprland when a rule changes. Removing an active rule can change its mode or layout immediately. Dynamic or ambiguous rules are shown but cannot be removed automatically. For live geometry and workspace moves, Preview (20s), then Apply to keep. No profiles.",
+    "description": "The green display highlight follows the cursor. Displays update automatically when connected or disconnected; Detect displays refreshes without clearing presentation preferences. Right-click a display for compact Displays, Workspaces, and Profiles tabs. Choose advertised resolution/refresh rate, scale, and placement; move workspace cards between displays. Preview (20s), then Apply to keep changes for this session only. Save current captures a named live arrangement, never draft edits. Profiles match hardware before connectors and load manually into a draft; replacement and deletion require confirmation and exact backups. No automatic switching. Names, curated Nerd Font icons, and column order save separately and immediately. Forget lists configured rules and saved preferences, including unnamed or disconnected displays. Confirmation removes supported exact rules and matching preferences with backups and guarded reload recovery; active layout changes are possible. Dynamic or ambiguous rules are refused. Faulty geometry blocks unsafe layout actions without hiding healthy displays or workspace cards.",
     "category": "Compositor",
     "allowMultiple": false
   },

@@ -4,7 +4,7 @@
 
 Omarchy Display Workspaces is a third-party Quickshell bar widget and compact display/workspace arrangement panel. Its public ID, QML module/IPC identity, and settings key are **`display.workspaces`**. Never use a developer username or homelab name as product identity. The `omarchy.*` namespace is first-party; `omarchy.workspaces` references that remain here identify the stock widget or upstream provenance.
 
-Keep the product narrow: multi-display workspace visibility, straightforward session arrangement with advertised resolution/refresh and scale controls, immediate presentation preferences, and deliberate configuration cleanup. Do not add profiles, rotation editing, HDR controls, dependencies, telemetry, or background services without a request.
+Keep the product narrow: multi-display workspace visibility, straightforward session arrangement with advertised resolution/refresh and scale controls, manual named live-arrangement profiles, immediate presentation preferences, and deliberate configuration cleanup. Do not add automatic profile switching, rotation editing, HDR controls, dependencies, telemetry, or background services without a request.
 
 Read `README.md`, `docs/INSTALLATION.md`, and `docs/USAGE.md` before behavior changes. Follow `docs/AGENTS.md` when editing documentation or screenshots.
 
@@ -16,7 +16,8 @@ Read `README.md`, `docs/INSTALLATION.md`, and `docs/USAGE.md` before behavior ch
 - `ArrangePopup.qml`, `DisplayMap.qml`: native popup and display geometry UI.
 - `apply.py`: discovery, validation, independent systemd preview/Forget workers, and runtime transaction state.
 - `configuration.py`: nonexecuting Lua scanner, configuration/preference catalog, revisions, exact backups and guarded restoration.
-- `test_apply.py`, `test_configuration.py`: isolated Python behavioral regression coverage.
+- `profiles.py`: versioned private profile store, guarded CRUD, hardware matching, and draft-only loading.
+- `test_apply.py`, `test_configuration.py`, `test_profiles.py`: isolated Python behavioral regression coverage.
 
 There is no build step. Reuse Omarchy's host QML components and Python's standard library.
 
@@ -24,6 +25,8 @@ There is no build step. Reuse Omarchy's host QML components and Python's standar
 
 - **Preview/Apply is session-only.** Keep the 20-second confirmation deadline and independent rollback worker. Never silently persist layout changes.
 - Mode/scale edits belong to the same complete draft transaction as positions. Validate advertised modes and whole logical pixels; preserve the original timing for an unchanged custom mode. Rollback may restore original geometry only when the live geometry still matches the original or intended target; preserve unrelated external changes.
+- Profiles save current live state, never untested draft edits, and load only into a draft. Match all enabled displays one-to-one; conflicting nonempty identities must never fall back to the same connector. Weak matches require an explicit warning. Preserve missing/new workspace behavior and keep presentation settings separate.
+- Profile replacement/deletion requires immutable ID/revision confirmation and exact backups before atomic writes. Refuse corrupt/unknown schemas and unsafe paths; never reset the store silently. Serialize storage across compositor sessions and block profile operations during preview/Forget.
 - Names/icons/order save separately through native shell APIs. Preserve disconnected display preferences and unrelated settings.
 - **Forget is destructive.** Require immutable key/revision confirmation; back up changed files before atomic writes. Validate reload/configuration errors. Preserve concurrent external edits during recovery.
 - Keep preview and Forget mutually exclusive. Worker lifetime must not depend on the panel remaining alive.
@@ -45,7 +48,7 @@ From the repository root:
 
 ```bash
 omarchy plugin validate .
-python3 -m unittest test_apply test_configuration
+python3 -m unittest test_apply test_configuration test_profiles
 ```
 
 For a backend behavioral change, exercise the changed path with isolated files, including relevant failure/recovery cases. A detached-worker change needs an actual worker-lifetime smoke, not only mocks. QML changes require opening the real components in a native harness or compatible Omarchy session; compilation alone is insufficient. Do not install extra tools merely to claim validation.
