@@ -13,6 +13,9 @@ Panel {
   ipcTarget: "display.workspaces"
   property var workspaceWidget: null
   property var anchor: workspaceWidget
+  readonly property var automationCoordinator: workspaceWidget && workspaceWidget.cursorTracker ? workspaceWidget.cursorTracker : null
+  readonly property string autoStatus: automationCoordinator ? automationCoordinator.autoStatus : "idle"
+  readonly property string autoMessage: automationCoordinator ? automationCoordinator.autoMessage : ""
   property var configurationEntries: []
   property string configurationRevision: ""
   property string configurationMessage: ""
@@ -30,6 +33,10 @@ Panel {
   property string profileCatalogMessage: ""
   property string profileFeedback: ""
   property bool profileFeedbackIsError: false
+  property string profileFeedbackDetails: ""
+  property bool profileDetailsExpanded: false
+  property bool automaticFeedbackDismissed: false
+  property string profileForm: ""
   property string selectedProfileId: ""
   property string profileNameText: ""
   property int profileGeneration: 0
@@ -43,6 +50,8 @@ Panel {
     && !previewLocked && forgetCandidate === null && !statusProcess.running && !validationProcess.running
     && !validationTimer.running && profileRevision !== ""
   readonly property bool profileNameValid: profileNameText.trim().length > 0 && profileNameText.trim().length <= 80
+  readonly property bool profileManaging: profileForm !== "" || profileCandidate !== null
+  readonly property bool automaticFailure: autoStatus === "failed" || (trialAutomatic && messageIsError && message !== "")
   property var liveBaseline: null
   property var displays: []
   property var unavailableMonitors: []
@@ -93,6 +102,8 @@ Panel {
   property int page: 0
   property string token: ""
   property string trialState: ""
+  property bool trialAutomatic: false
+  property string trialProfileName: ""
   property int secondsRemaining: 0
   property var queuedRequest: null
   property bool completingRequest: false
@@ -114,11 +125,11 @@ Panel {
   readonly property string panelScreen: anchor && anchor.QsWindow.window && anchor.QsWindow.window.screen ? anchor.QsWindow.window.screen.name : ""
 
   function close() {
-    if (!previewLocked) controller.hide()
+    if (!previewLocked || trialAutomatic) controller.hide()
   }
 
   function request(action, payload) {
-    if (action === "keep" && (layoutBlocked || refreshPending)) return
+    if (action === "keep" && (trialAutomatic || layoutBlocked || refreshPending)) return
     // Destructive actions are never queued behind another operation.
     if (action === "forget" && (!forgetReady || !payload || payload.revision !== configurationRevision)) return
     if (requestProcess.running || completingRequest) { queuedRequest = { action: action, payload: payload }; return }
@@ -131,7 +142,7 @@ Panel {
   }
   function decode(text) {
     try { return JSON.parse(text) }
-    catch (error) { return { ok: false, message: "Could not read the display service response. No confirmation was sent; an active trial will revert automatically." } }
+    catch (error) { return { ok: false, message: "Could not read the display service response. No confirmation was sent. Open the panel again to recover an active trial's status; automatic trials may still keep after verification." } }
   }
   function refreshPresentation() {
     if (!workspaceWidget) return
@@ -209,6 +220,8 @@ Panel {
       profileFeedbackIsError = false
     }
     profileCandidate = null
+    profileForm = ""
+    profileMenu.close()
     profileGeneration++
     profilePending = true
     if (opened) profileTimer.restart()
@@ -235,23 +248,32 @@ Panel {
     profileCatalogMessage = ""
   }
   function selectProfile(id) {
-    if (!profileReady || profileCandidate !== null) return
+    if (!profileReady || profileManaging) return
     profileCandidate = null
     selectedProfileId = id
     profileNameText = selectedProfile ? selectedProfile.name : ""
+    profileDetailsExpanded = false
   }
-  function profileMatchLabel(entry) {
-    if (!entry) return profileEntries.length ? "Select a profile." : "No saved profiles. Name the current live arrangement to save it."
-    var match = entry.match === "hardware" ? "Hardware match"
-      : entry.match === "port-dependent" ? "Port-dependent match" : "Unavailable on current displays"
-    return match + " · " + entry.displayCount + " displays · " + entry.workspaceCount + " workspaces\n"
-      + (entry.reason || (entry.canLoad ? "Choose Load into draft to use this profile." : "This profile cannot be loaded."))
+  function beginProfileForm(form) {
+    if (!profileReady || profileManaging || layoutBlocked || (form === "update" && !selectedProfile)) return
+    profileForm = form
+    profileNameText = form === "update" ? selectedProfile.name : ""
+    profileFeedback = ""
+    profileDetailsExpanded = false
+    Qt.callLater(function() { profileNameInput.forceActiveFocus(); profileNameInput.selectAll() })
+  }
+  function suppressAutomation() {
+    if (workspaceWidget && typeof workspaceWidget.requestAutomationCheck === "function")
+      workspaceWidget.requestAutomationCheck(false, true)
   }
   function startProfile(action, payload) {
     if (!profileReady || payload.revision !== profileRevision) return
     profileCandidate = null
-    profileFeedback = action === "profile-load" ? "Loading profile into draft…"
-      : action === "profile-delete" ? "Deleting saved profile…" : "Saving the current live arrangement, not the draft…"
+    profileFeedbackTimer.stop()
+    profileFeedbackDetails = ""
+    profileFeedback = action === "profile-load" ? "Preparing layout…"
+      : action === "profile-auto" ? "Updating automatic restoration…"
+      : action === "profile-delete" ? "Deleting profile…" : "Saving live arrangement…"
     profileFeedbackIsError = false
     profileProcess.action = action
     profileProcess.generation = profileGeneration
@@ -260,13 +282,14 @@ Panel {
     profileProcess.running = true
   }
   function saveCurrentProfile() {
-    if (!profileReady || !profileNameValid || profileCandidate !== null) return
+    if (!profileReady || profileForm !== "new" || !profileNameValid || profileCandidate !== null) return
     startProfile("profile-save", { name: profileNameText.trim(), baseline: liveBaseline, revision: profileRevision })
   }
   function prepareProfile(action) {
     if (!profileReady || profileCandidate !== null || !selectedProfile
-        || (action === "profile-save" && !profileNameValid)
-        || (action === "profile-load" && !selectedProfile.canLoad)) return
+        || (action === "profile-save" && (profileForm !== "update" || !profileNameValid))
+        || (action === "profile-load" && !selectedProfile.canLoad)
+        || (action === "profile-auto" && !selectedProfile.automatic && !selectedProfile.canAutomate)) return
     var entry = selectedProfile
     var edited = hasDisplayEdits() || profileWorkspaces !== null || draft.some(function(w) { return w.source !== w.target })
     if (action === "profile-load" && !edited) {
@@ -274,12 +297,15 @@ Panel {
       return
     }
     var name = profileNameText.trim()
-    var warning = action === "profile-delete" ? "Delete saved profile “" + entry.name + "”? Its previous file is backed up. Live displays and your draft are unchanged."
-      : action === "profile-save" ? "Replace “" + entry.name + "” with the current LIVE arrangement"
-        + (name !== entry.name ? " and rename it to “" + name + "”" : "") + "? Unsaved draft edits are not saved. The previous file is backed up."
-      : "Discard unsaved display and workspace draft edits and load “" + entry.name + "”? This does not change live displays."
+    var warning = action === "profile-auto" ? (entry.automatic
+      ? "Turn off automatic restoration for “" + entry.name + "”? Live displays and your draft stay unchanged."
+      : "Restore “" + entry.name + "” on reconnect or session start without asking?\nChanges keep automatically after 20 seconds of checks. You can Revert during that time; recovery is not guaranteed. Only enable an arrangement you have checked physically.")
+      : action === "profile-delete" ? "Delete “" + entry.name + "”? A backup is kept. Live displays and your draft stay unchanged."
+      : action === "profile-save" ? "Update “" + entry.name + "” from the current LIVE arrangement"
+        + (name !== entry.name ? " and rename it to “" + name + "”" : "") + "?\nDraft edits are not saved. Automatic restoration turns off. A backup is kept."
+      : "Discard your draft edits and review “" + entry.name + "”? Live displays stay unchanged."
     profileCandidate = { action: action, id: entry.id, revision: profileRevision, name: entry.name,
-      replacementName: name, generation: profileGeneration, draftRevision: revision, warning: warning }
+      replacementName: name, enabled: !entry.automatic, generation: profileGeneration, draftRevision: revision, warning: warning }
   }
   function confirmProfile() {
     var candidate = profileCandidate
@@ -297,11 +323,13 @@ Panel {
       payload.name = candidate.replacementName
       payload.baseline = liveBaseline
     }
+    if (candidate.action === "profile-auto") payload.enabled = candidate.enabled
     startProfile(candidate.action, payload)
   }
   function profileResponse(action, result) {
     if (!result.ok) {
       var failure = result.message || "Profile operation failed. Detect displays to refresh before trying again."
+      profileFeedbackTimer.stop()
       if (action === "profiles") {
         profileRevision = ""
         profileCatalogMessage = failure
@@ -327,25 +355,53 @@ Panel {
       topologyNotice = ""
       page = 0
       changed()
-      profileFeedback = result.message || "Profile loaded into draft. Review, then Preview (20s) and Apply for this session only."
+      profileFeedback = "Profile ready to review. Preview and Apply to keep it for this session."
       profileFeedbackIsError = false
+      profileFeedbackDetails = result.message || ""
+      profileFeedbackTimer.restart()
       refreshProfiles()
     } else {
       adoptProfiles(result)
-      if (action === "profiles") profileCatalogMessage = result.message || ""
+      if (action !== "profiles") profileForm = ""
       if (action !== "profiles") {
-        profileFeedback = result.message || (action === "profile-delete" ? "Profile deleted. Live displays are unchanged." : "Current live arrangement saved. Draft edits are unchanged.")
-        if (result.backupPaths && result.backupPaths.length) profileFeedback += "\nBackups: " + result.backupPaths.join(", ")
+        profileFeedback = action === "profile-auto" ? "Automatic restoration updated."
+          : action === "profile-delete" ? "Profile deleted." : "Live arrangement saved."
+        profileFeedbackDetails = result.message || ""
+        if (result.backupPaths && result.backupPaths.length) profileFeedbackDetails += "\nBackups: " + result.backupPaths.join(", ")
         profileFeedbackIsError = false
+        profileFeedbackTimer.restart()
       }
     }
   }
-  onPageChanged: if (page !== 2) profileCandidate = null
+  onPageChanged: {
+    profileMenu.close()
+    if (page !== 2) { profileCandidate = null; profileForm = "" }
+  }
+  onSelectedProfileIdChanged: profilePicker.value = selectedProfileId
+  onAutoMessageChanged: automaticFeedbackDismissed = false
   onForgetCandidateChanged: if (forgetCandidate === null) Qt.callLater(loadProfiles)
   Connections {
     target: root.workspaceWidget
     function onSettingsChanged() { root.refreshPresentation(); root.refreshConfiguration() }
     function onDisplayRanksChanged() { root.refreshPresentation() }
+  }
+  onAutomationCoordinatorChanged: Qt.callLater(observeAutomatic)
+  Connections {
+    target: root.automationCoordinator
+    function onAutoResultChanged() { root.observeAutomatic() }
+  }
+  function observeAutomatic() {
+    var result = automationCoordinator ? automationCoordinator.autoResult : null
+    if (!result || !result.automatic || !result.token) return
+    var state = result.state || result.status
+    if (trialAutomatic && token === result.token) {
+      receiveState(result)
+      refreshWhenSafe()
+      loadProfiles()
+    } else if ((state === "starting" || state === "pending")
+        && (opened || workspaceWidget === automationCoordinator) && !requestPending && !profileActive) {
+      request("resume")
+    }
   }
   Connections {
     target: Hyprland
@@ -644,6 +700,8 @@ Panel {
       message = result.message
       messageIsError = result.ok === false || result.state === "failed"
     }
+    if (result.automatic !== undefined) trialAutomatic = result.automatic === true
+    if (result.profileName !== undefined) trialProfileName = result.profileName || ""
     if (result.token) token = result.token
     if (result.state === "pending" && trialState !== "pending") {
       Hyprland.refreshMonitors()
@@ -659,7 +717,7 @@ Panel {
       Hyprland.refreshWorkspaces()
       if (trialState === "kept") root.close()
       else if (root.opened) refreshPending = true
-    } else if (trialActive && !root.opened) {
+    } else if (trialActive && !trialAutomatic && !root.opened) {
       root.open()
     }
   }
@@ -709,7 +767,8 @@ Panel {
       Hyprland.refreshWorkspaces()
     }
     else if (action === "resume") {
-      if (result.token && (root.opened || result.uiScreen === panelScreen)) {
+      if (result.token && (root.opened || result.uiScreen === panelScreen
+          || (result.automatic && workspaceWidget === automationCoordinator))) {
         adoptSnapshot(result.baseline)
         positions = result.plan.positions.map(function(p) { return Object.assign({}, p) })
         adoptWorkspacePlan(result.plan)
@@ -737,8 +796,8 @@ Panel {
         refreshPending = true
         if (!requestPending && !profileActive) request("resume")
       }
-    } else if (previewLocked) {
-      Qt.callLater(function() { if (root.previewLocked) root.open() })
+    } else if (previewLocked && !trialAutomatic) {
+      Qt.callLater(function() { if (root.previewLocked && !root.trialAutomatic) root.open() })
     }
   }
 
@@ -763,6 +822,7 @@ Panel {
     onExited: function(code, status) {
       root.completingRequest = true
       root.response(action, root.decode(responseOutput.text))
+      if (action === "begin" || action === "forget") root.suppressAutomation()
       Qt.callLater(function() {
         root.completingRequest = false
         if (root.queuedRequest && !requestProcess.running) {
@@ -770,6 +830,7 @@ Panel {
           root.queuedRequest = null
           root.request(next.action, next.payload)
         }
+        root.observeAutomatic()
         root.refreshWhenSafe()
         root.loadConfiguration()
         root.loadProfiles()
@@ -808,6 +869,17 @@ Panel {
     interval: 200
     onTriggered: root.loadProfiles()
   }
+  Timer {
+    id: profileFeedbackTimer
+    interval: 6000
+    onTriggered: if (!root.profileFeedbackIsError) root.profileFeedback = ""
+  }
+  Timer {
+    interval: 6000
+    running: root.opened && !root.automaticFeedbackDismissed
+      && ["kept", "reverted", "skipped"].indexOf(root.autoStatus) !== -1
+    onTriggered: root.automaticFeedbackDismissed = true
+  }
   Process {
     id: profileProcess
     objectName: "profile-process"
@@ -820,8 +892,10 @@ Panel {
       root.completingProfile = true
       if (generation === root.profileGeneration && root.opened)
         root.profileResponse(action, root.decode(profileOutput.text))
+      if (action !== "profiles") root.suppressAutomation()
       Qt.callLater(function() {
         root.completingProfile = false
+        root.observeAutomatic()
         root.refreshWhenSafe()
         root.loadConfiguration()
         root.loadProfiles()
@@ -859,7 +933,7 @@ Panel {
   Timer {
     interval: 250
     repeat: true
-    running: root.trialActive
+    running: root.trialActive && !root.trialAutomatic
     onTriggered: {
       if (statusProcess.running || requestProcess.running) return
       statusProcess.command = ["python3", Qt.resolvedUrl("apply.py").toString().replace("file://", ""), "status", root.token]
@@ -1092,64 +1166,215 @@ Panel {
           width: parent.width
           spacing: Style.space(8)
           visible: root.page === 2
-          Text {
-            objectName: "profile-save-explanation"
-            width: parent.width
-            text: "Save current captures the LIVE display and workspace arrangement, never unsaved draft edits. Profiles persist on disk; loading only edits the draft. Preview and Apply remain session-only."
-            color: Color.foreground
-            font.family: Style.font.family
-            font.pixelSize: Style.font.bodySmall
-            textFormat: Text.PlainText
-            wrapMode: Text.WordWrap
-          }
           RowLayout {
             width: parent.width
             spacing: Style.space(8)
-            Text { text: "Saved profile"; color: Color.foreground; font.family: Style.font.family; font.pixelSize: Style.font.bodySmall }
-            ComboBox {
+            Dropdown {
               id: profilePicker
               objectName: "profile-picker"
               Accessible.name: "Saved profile"
               Layout.fillWidth: true
               Layout.minimumWidth: 0
-              model: root.profileEntries
-              textRole: "name"
-              valueRole: "id"
-              currentIndex: root.profileEntries.map(function(entry) { return entry.id }).indexOf(root.selectedProfileId)
-              enabled: root.profileReady && root.profileCandidate === null && count > 0
-              onActivated: function(index) {
-                var entry = model[index]
-                if (entry) root.selectProfile(entry.id)
+              showLabel: false
+              options: root.profileEntries.map(function(entry) { return { value: entry.id, label: entry.name } })
+              value: root.selectedProfileId
+              enabled: root.profileReady && !root.profileManaging && root.profileEntries.length > 0
+              onChanged: function(value) {
+                root.selectProfile(value)
+                profilePicker.value = root.selectedProfileId
+              }
+            }
+            Button {
+              objectName: "profile-new"
+              text: "+ New"
+              Accessible.name: "Save a new profile from the current live arrangement"
+              bordered: true
+              focusable: true
+              verticalPadding: Style.space(4)
+              enabled: root.profileReady && !root.profileManaging && !root.layoutBlocked
+              opacity: enabled ? 1 : 0.45
+              onClicked: root.beginProfileForm("new")
+            }
+            Button {
+              id: profileMore
+              objectName: "profile-more"
+              text: "More"
+              Accessible.name: "More profile actions"
+              bordered: true
+              focusable: true
+              verticalPadding: Style.space(4)
+              enabled: root.profileReady && !root.profileManaging && root.selectedProfile !== null
+              opacity: enabled ? 1 : 0.45
+              onClicked: profileMenu.open()
+              onEnabledChanged: if (!enabled) profileMenu.close()
+              Menu {
+                id: profileMenu
+                objectName: "profile-menu"
+                x: profileMore.width - width
+                y: profileMore.height
+                width: Math.max(profileUpdateItem.implicitWidth, profileDeleteItem.implicitWidth) + leftPadding + rightPadding
+                font.family: Style.font.family
+                font.pixelSize: Style.font.body
+                palette.windowText: Color.foreground
+                palette.text: Color.foreground
+                palette.highlight: Color.accent
+                palette.highlightedText: Color.background
+                background: BorderSurface {
+                  color: Color.popups.background
+                  radius: Style.cornerRadius
+                  borderSpec: Border.surfaceSpec("popups", "border", Color.popups.border, Style.normalBorderWidth)
+                }
+                MenuItem {
+                  id: profileUpdateItem
+                  objectName: "profile-update"
+                  text: "Update from current…"
+                  enabled: !root.layoutBlocked
+                  onTriggered: root.beginProfileForm("update")
+                }
+                MenuItem {
+                  id: profileDeleteItem
+                  objectName: "profile-delete"
+                  text: "Delete…"
+                  onTriggered: root.prepareProfile("profile-delete")
+                }
               }
             }
           }
-          Text {
-            objectName: "profile-match-status"
-            Accessible.name: text
+          RowLayout {
             width: parent.width
-            text: root.profileBusy ? "Refreshing saved profiles and current display compatibility…" : root.profileMatchLabel(root.selectedProfile)
-            color: !root.profileBusy && root.selectedProfile && !root.selectedProfile.canLoad ? Color.urgent : Color.foreground
+            spacing: Style.space(8)
+            Text {
+              objectName: "profile-summary"
+              Layout.fillWidth: true
+              Layout.minimumWidth: 0
+              text: root.selectedProfile
+                ? root.selectedProfile.displayCount + " displays · " + root.selectedProfile.workspaceCount + " workspaces"
+                : root.profileBusy ? "Loading profiles…" : "No saved profiles. Choose New to save this live arrangement."
+              color: Color.foreground
+              font.family: Style.font.family
+              font.pixelSize: Style.font.bodySmall
+              wrapMode: Text.Wrap
+            }
+            Button {
+              objectName: "profile-match-status"
+              visible: root.selectedProfile !== null
+              text: root.profileBusy ? "Checking…"
+                : !root.selectedProfile || !root.selectedProfile.canLoad ? "Unavailable"
+                : root.selectedProfile.match === "hardware" ? "Ready" : "Check displays"
+              Accessible.name: text + ". Show compatibility details"
+              selected: true
+              focusable: true
+              foreground: root.selectedProfile && (!root.selectedProfile.canLoad || root.selectedProfile.match !== "hardware") ? Color.urgent : Color.foreground
+              verticalPadding: Style.space(2)
+              onClicked: root.profileDetailsExpanded = !root.profileDetailsExpanded
+            }
+          }
+          Text {
+            width: parent.width
+            visible: root.selectedProfile !== null && !root.profileBusy
+              && (!root.selectedProfile.canLoad || root.selectedProfile.match !== "hardware")
+            text: root.selectedProfile && root.selectedProfile.canLoad
+              ? "Port-dependent match — verify the displays before Preview."
+              : "This profile is unavailable on the current displays. Check Details."
+            color: Color.urgent
+            font.family: Style.font.family
+            font.pixelSize: Style.font.bodySmall
+            wrapMode: Text.Wrap
+          }
+          Button {
+            objectName: "profile-details-toggle"
+            text: root.profileDetailsExpanded ? "Hide details" : "Details"
+            visible: root.selectedProfile !== null || root.profileFeedbackDetails !== "" || root.autoMessage !== ""
+            focusable: true
+            verticalPadding: Style.space(2)
+            onClicked: root.profileDetailsExpanded = !root.profileDetailsExpanded
+          }
+          Text {
+            objectName: "profile-details"
+            width: parent.width
+            visible: root.profileDetailsExpanded
+            text: [
+              root.selectedProfile ? root.selectedProfile.reason || "" : "",
+              root.selectedProfile && !root.selectedProfile.automatic && !root.selectedProfile.canAutomate
+                ? "Automatic restoration: " + root.selectedProfile.automaticReason : "",
+              root.profileFeedbackDetails ? "Last profile operation:\n" + root.profileFeedbackDetails : "",
+              root.autoMessage ? "Automatic restoration:\n" + root.autoMessage : ""
+            ].filter(function(part) { return part !== "" }).join("\n\n")
+            color: Color.foreground
             font.family: Style.font.family
             font.pixelSize: Style.font.bodySmall
             textFormat: Text.PlainText
             wrapMode: Text.Wrap
           }
-          Text {
-            objectName: "profile-catalog-message"
+          PanelSeparator { width: parent.width; visible: root.selectedProfile !== null }
+          RowLayout {
             width: parent.width
-            visible: text !== "" && !root.profileBusy
-            text: root.profileCatalogMessage
-            color: root.profileRevision === "" ? Color.urgent : Color.foreground
+            spacing: Style.space(8)
+            visible: root.selectedProfile !== null
+            ColumnLayout {
+              Layout.fillWidth: true
+              Layout.minimumWidth: 0
+              spacing: Style.space(3)
+              Text {
+                text: "Restore automatically"
+                color: Color.foreground
+                font.family: Style.font.family
+                font.pixelSize: Style.font.body
+              }
+              Text {
+                objectName: "profile-automatic-status"
+                Layout.fillWidth: true
+                text: root.selectedProfile && !root.selectedProfile.automatic && !root.selectedProfile.canAutomate
+                  ? "Not available for this profile. Check Details."
+                  : "When this display combination reconnects."
+                color: Color.foreground
+                font.family: Style.font.family
+                font.pixelSize: Style.font.bodySmall
+                wrapMode: Text.Wrap
+              }
+            }
+            Text {
+              text: root.selectedProfile && root.selectedProfile.automatic ? "On" : "Off"
+              color: Color.foreground
+              font.family: Style.font.family
+              font.pixelSize: Style.font.bodySmall
+            }
+            ToggleSwitch {
+              objectName: "profile-automatic"
+              Accessible.role: Accessible.CheckBox
+              Accessible.name: "Restore selected profile automatically"
+              Accessible.checked: checked
+              checked: root.selectedProfile !== null && root.selectedProfile.automatic
+              activeFocusOnTab: enabled
+              hasCursor: activeFocus
+              enabled: root.profileReady && !root.profileManaging && root.selectedProfile !== null
+                && (root.selectedProfile.automatic || root.selectedProfile.canAutomate)
+              opacity: enabled ? 1 : 0.45
+              Keys.onSpacePressed: if (enabled) root.prepareProfile("profile-auto")
+              Keys.onReturnPressed: if (enabled) root.prepareProfile("profile-auto")
+              onToggled: root.prepareProfile("profile-auto")
+            }
+          }
+          PanelSeparator { width: parent.width; visible: root.profileForm !== "" }
+          Text {
+            objectName: "profile-save-explanation"
+            width: parent.width
+            visible: root.profileForm !== ""
+            text: root.profileForm === "update"
+              ? "Update from the current live arrangement, not draft edits. Automatic restoration will turn off."
+              : "Save the current live arrangement, not draft edits."
+            color: Color.foreground
             font.family: Style.font.family
             font.pixelSize: Style.font.bodySmall
-            textFormat: Text.PlainText
             wrapMode: Text.Wrap
           }
           RowLayout {
             width: parent.width
             spacing: Style.space(8)
+            visible: root.profileForm !== ""
             Text { text: "Profile name"; color: Color.foreground; font.family: Style.font.family; font.pixelSize: Style.font.bodySmall }
             TextField {
+              id: profileNameInput
               objectName: "profile-name"
               Accessible.name: "Profile name, up to 80 characters"
               Layout.fillWidth: true
@@ -1387,12 +1612,21 @@ Panel {
           wrapMode: Text.WordWrap
         }
         Text {
-          objectName: "profile-feedback"
+          objectName: "profile-operation-status"
           Accessible.name: text
           width: parent.width
-          visible: text !== "" && !root.previewLocked
-          text: root.profileFeedback
-          color: root.profileFeedbackIsError ? Color.urgent : Color.foreground
+          visible: text !== ""
+          text: root.trialActive && root.trialAutomatic
+            ? "Restoring " + (root.trialProfileName ? "“" + root.trialProfileName + "”" : "saved arrangement")
+              + (root.trialState === "starting" ? "…" : " — keeps in " + root.secondsRemaining + "s")
+            : root.automaticFailure ? (root.trialAutomatic && root.messageIsError ? root.message : root.autoMessage)
+            : root.page === 2 && root.profileCatalogMessage ? root.profileCatalogMessage
+            : !root.previewLocked && root.profileFeedback ? root.profileFeedback
+            : root.page !== 2 || root.automaticFeedbackDismissed ? ""
+            : root.autoStatus === "kept" ? "Automatic restore complete."
+            : root.autoStatus === "reverted" ? "Automatic restore reverted."
+            : root.autoStatus === "skipped" ? "Automatic restore skipped. Check Details." : ""
+          color: root.automaticFailure || root.profileFeedbackIsError || (root.page === 2 && root.profileCatalogMessage !== "") ? Color.urgent : Color.foreground
           font.family: Style.font.family
           font.pixelSize: Style.font.bodySmall
           textFormat: Text.PlainText
@@ -1402,10 +1636,11 @@ Panel {
           id: statusLabel
           width: parent.width
           visible: text !== ""
-          text: root.messageIsError && root.message ? root.message
+          text: root.trialAutomatic && root.automaticFailure ? ""
+            : root.messageIsError && root.message ? root.message
             : root.trialActive ? ""
             : root.previewLocked ? "Starting preview…"
-            : !root.valid ? root.validationMessage : ""
+            : root.page !== 2 && !root.valid ? root.validationMessage : ""
           color: (root.messageIsError && root.message) || (!root.valid && !root.previewLocked && !root.refreshPending && root.liveBaseline && !validationTimer.running && !validationProcess.running) ? Color.urgent : Color.foreground
           font.family: Style.font.family
           font.pixelSize: Style.font.bodySmall
@@ -1425,62 +1660,47 @@ Panel {
           width: parent.width
           spacing: Style.space(4)
           Text {
-            visible: root.page !== 2 || root.profileCandidate !== null
+            Layout.minimumWidth: 0
             Layout.fillWidth: true
-            text: root.trialActive ? "Reverts in " + root.secondsRemaining + "s"
-              : root.page !== 2 && root.changeCount > 0 ? root.changeCount + " pending" : ""
+            text: root.trialActive ? (root.trialAutomatic ? "" : "Reverts in " + root.secondsRemaining + "s")
+              : root.page === 2 ? (root.profileManaging ? "" : "Review before applying.")
+              : root.changeCount > 0 ? root.changeCount + " pending" : ""
             color: Color.foreground
             font.family: Style.font.family
             font.pixelSize: Style.font.bodySmall
           }
-          Flow {
-            Layout.fillWidth: true
-            Layout.minimumWidth: 0
-            visible: root.page === 2 && root.profileCandidate === null
-            spacing: Style.space(5)
-            Button {
-              objectName: "profile-save-current"
-              text: "Save current (new)"
-              Accessible.name: "Save current live arrangement as a new profile"
-              verticalPadding: Style.space(4)
-              enabled: root.profileReady && root.profileNameValid && !root.layoutBlocked && root.profileCandidate === null
-              opacity: enabled ? 1 : 0.45
-              onClicked: root.saveCurrentProfile()
-            }
-            Button {
-              objectName: "profile-replace"
-              text: "Replace selected"
-              Accessible.name: "Replace or rename selected profile with the current live arrangement"
-              verticalPadding: Style.space(4)
-              enabled: root.profileReady && root.selectedProfile !== null && root.profileNameValid && !root.layoutBlocked && root.profileCandidate === null
-              opacity: enabled ? 1 : 0.45
-              onClicked: root.prepareProfile("profile-save")
-            }
-            Button {
-              objectName: "profile-delete"
-              text: "Delete selected"
-              Accessible.name: "Delete selected saved profile"
-              verticalPadding: Style.space(4)
-              enabled: root.profileReady && root.selectedProfile !== null && root.profileCandidate === null
-              opacity: enabled ? 1 : 0.45
-              onClicked: root.prepareProfile("profile-delete")
-            }
-            Button {
-              objectName: "profile-load"
-              text: "Load into draft"
-              Accessible.name: "Load selected profile into draft without applying live changes"
-              verticalPadding: Style.space(4)
-              enabled: root.profileReady && root.selectedProfile !== null && root.selectedProfile.canLoad && root.profileCandidate === null
-              opacity: enabled ? 1 : 0.45
-              onClicked: root.prepareProfile("profile-load")
-            }
+          Button {
+            objectName: "profile-save-current"
+            visible: root.page === 2 && root.profileForm === "new" && root.profileCandidate === null && !root.trialActive
+            text: "Save profile"
+            Accessible.name: "Save current live arrangement as a new profile"
+            selected: true
+            focusable: true
+            verticalPadding: Style.space(4)
+            enabled: root.profileReady && root.profileNameValid && !root.layoutBlocked
+            opacity: enabled ? 1 : 0.45
+            onClicked: root.saveCurrentProfile()
+          }
+          Button {
+            objectName: "profile-update-review"
+            visible: root.page === 2 && root.profileForm === "update" && root.profileCandidate === null && !root.trialActive
+            text: "Review update"
+            selected: true
+            focusable: true
+            verticalPadding: Style.space(4)
+            enabled: root.profileReady && root.profileNameValid && !root.layoutBlocked && root.selectedProfile !== null
+            opacity: enabled ? 1 : 0.45
+            onClicked: root.prepareProfile("profile-save")
           }
           Button {
             objectName: "profile-confirm"
             visible: root.page === 2 && root.profileCandidate !== null
             text: root.profileCandidate && root.profileCandidate.action === "profile-delete" ? "Confirm delete"
-              : root.profileCandidate && root.profileCandidate.action === "profile-save" ? "Confirm replace" : "Discard edits and load"
+              : root.profileCandidate && root.profileCandidate.action === "profile-save" ? "Confirm update"
+              : root.profileCandidate && root.profileCandidate.action === "profile-auto"
+                ? (root.profileCandidate.enabled ? "Turn on" : "Turn off") : "Discard and review"
             Accessible.name: text
+            focusable: true
             verticalPadding: Style.space(4)
             enabled: root.profileReady && root.profileCandidate !== null
             opacity: enabled ? 1 : 0.45
@@ -1488,15 +1708,31 @@ Panel {
           }
           Button {
             objectName: "cancel"
-            text: root.trialActive ? "Revert" : "Cancel"
+            text: root.trialActive ? "Revert" : root.page === 2 && !root.profileManaging ? "Close" : "Cancel"
             verticalPadding: Style.space(4)
+            focusable: true
             enabled: !requestProcess.running
             Accessible.name: root.page === 2 && root.profileCandidate !== null ? "Cancel profile confirmation" : text
             onClicked: {
               if (root.trialActive) root.request("revert", root.token)
-              else if (root.page === 2 && root.profileCandidate !== null) root.profileCandidate = null
+              else if (root.page === 2 && root.profileManaging) {
+                root.profileCandidate = null
+                root.profileForm = ""
+              }
               else root.close()
             }
+          }
+          Button {
+            objectName: "profile-load"
+            visible: root.page === 2 && !root.profileManaging && !root.trialActive
+            text: "Review layout"
+            Accessible.name: "Review selected profile as a draft without applying live changes"
+            selected: true
+            focusable: true
+            verticalPadding: Style.space(4)
+            enabled: root.profileReady && root.selectedProfile !== null && root.selectedProfile.canLoad
+            opacity: enabled ? 1 : 0.45
+            onClicked: root.prepareProfile("profile-load")
           }
           Button {
             objectName: "preview"
@@ -1509,10 +1745,10 @@ Panel {
           }
           Button {
             objectName: "apply"
-            visible: root.page !== 2
+            visible: root.page !== 2 && !(root.trialActive && root.trialAutomatic)
             text: "Apply"
             verticalPadding: Style.space(4)
-            enabled: !requestProcess.running && !root.layoutBlocked && !root.refreshPending && root.trialState === "pending" && root.trialActive && root.secondsRemaining > 0
+            enabled: !root.trialAutomatic && !requestProcess.running && !root.layoutBlocked && !root.refreshPending && root.trialState === "pending" && root.trialActive && root.secondsRemaining > 0
             opacity: enabled ? 1 : 0.45
             onClicked: root.request("keep", root.token)
           }

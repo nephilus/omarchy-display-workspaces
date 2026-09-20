@@ -22,17 +22,49 @@ BarWidget {
   readonly property bool cursorQueryRunning: cursorQuery.running
   readonly property string cursorDisplayName: cursorKnown ? displayAt(cursorPosition.x, cursorPosition.y) : ""
 
+  readonly property bool automationBlocked: arranger.opened
+  readonly property bool autoQueryRunning: automaticQuery.running || completingAutomatic
+  property bool autoEventPending: false
+  property bool autoBlockPending: false
+  property bool autoCheckPending: false
+  property bool completingAutomatic: false
+  property string autoStatus: "idle"
+  property string autoMessage: ""
+  property var autoResult: null
+
+  onAutomationBlockedChanged: if (automationBlocked) requestAutomationCheck(false, true)
+
   onCursorTrackerChanged: {
     cursorKnown = false
-    if (cursorTracker === root) topologyRefresh.restart()
+    if (cursorTracker === root) {
+      topologyRefresh.restart()
+      requestAutomationCheck(false, false)
+    }
     else {
       cursorQuery.running = false
       topologyRefresh.stop()
+      workspaceFocusRefresh.stop()
+      automaticTimer.stop()
+      handoffAutomation(cursorTracker)
     }
   }
   Component.onDestruction: {
     cursorQuery.running = false
     topologyRefresh.stop()
+    workspaceFocusRefresh.stop()
+    automaticTimer.stop()
+    if (automaticQuery.running) {
+      autoEventPending = autoEventPending || automaticQuery.sentEvent
+      autoBlockPending = autoBlockPending || automaticQuery.sentBlocked
+      autoCheckPending = true
+    }
+    var widgets = automationWidgets()
+    for (var i = 0; i < widgets.length; ++i) {
+      if (widgets[i] && widgets[i] !== root) {
+        handoffAutomation(widgets[i])
+        break
+      }
+    }
   }
 
   // Only the elected widget queries topology. Refreshing the models does not
@@ -51,10 +83,140 @@ BarWidget {
     target: Hyprland
     enabled: root.cursorTracker === root
     function onRawEvent(event) {
-      if (event.name === "monitoradded" || event.name === "monitoraddedv2"
-          || event.name === "monitorremoved" || event.name === "monitorremovedv2"
-          || event.name === "configreloaded")
-        topologyRefresh.restart()
+      var hotplug = event.name === "monitoradded" || event.name === "monitoraddedv2"
+        || event.name === "monitorremoved" || event.name === "monitorremovedv2"
+      if (hotplug || event.name === "configreloaded") topologyRefresh.restart()
+      if (hotplug) root.requestAutomationCheck(true, false)
+    }
+  }
+
+  // Quickshell 0.3.1 does not reconnect its shared Hyprland event socket.
+  // Keep keyboard focus recoverable without polling or replaying automation.
+  HyprlandEventStream {
+    active: root.cursorTracker === root
+    path: Hyprland.eventSocketPath
+    onOpened: workspaceFocusRefresh.start()
+    onEventReceived: function(name) {
+      if (name.indexOf("workspace") === 0 || name.indexOf("focusedmon") === 0
+          || name.indexOf("moveworkspace") === 0 || name.indexOf("activespecial") === 0
+          || name.indexOf("monitor") === 0 || name === "configreloaded")
+        workspaceFocusRefresh.start()
+    }
+  }
+  Timer {
+    id: workspaceFocusRefresh
+    interval: 40
+    onTriggered: {
+      if (root.cursorTracker === root) Hyprland.refreshMonitors()
+    }
+  }
+
+  function automationWidgets() {
+    return bar && typeof bar.moduleWidgets === "function" ? bar.moduleWidgets(moduleName) : []
+  }
+  function handoffAutomation(owner) {
+    if (!owner || owner === root) return
+    // Queue directly: during destruction the recipient's election binding may
+    // still point back at this widget. Do not recursively route through it.
+    owner.autoEventPending = owner.autoEventPending || autoEventPending
+    owner.autoBlockPending = owner.autoBlockPending || autoBlockPending
+    owner.autoCheckPending = owner.autoCheckPending || autoCheckPending || autoEventPending || autoBlockPending
+    autoCheckPending = false
+    autoEventPending = false
+    autoBlockPending = false
+    if (owner.autoCheckPending) owner.scheduleAutomationCheck(1)
+  }
+  function requestAutomationCheck(event, blocked) {
+    // Keep events arriving during a query distinct from the query in flight.
+    autoEventPending = autoEventPending || event === true
+    autoBlockPending = autoBlockPending || blocked === true
+    autoCheckPending = true
+    if (cursorTracker && cursorTracker !== root) {
+      handoffAutomation(cursorTracker)
+      return
+    }
+    scheduleAutomationCheck(1)
+  }
+  function scheduleAutomationCheck(delay) {
+    if (cursorTracker !== root) return
+    if (autoCheckPending) delay = 1
+    if (!finiteNumber(delay) || delay <= 0) return
+    automaticTimer.interval = Math.max(1, Math.ceil(delay))
+    automaticTimer.restart()
+  }
+  function checkAutomation() {
+    if (cursorTracker !== root || autoQueryRunning) return
+    var widgets = automationWidgets()
+    var event = autoEventPending, blocked = autoBlockPending || automationBlocked
+    for (var i = 0; i < widgets.length; ++i) {
+      var widget = widgets[i]
+      if (!widget) continue
+      // Let a departing owner finish its short CLI call; it will wake us.
+      if (widget !== root && widget.autoQueryRunning) return
+      event = event || widget.autoEventPending
+      blocked = blocked || widget.autoBlockPending || widget.automationBlocked
+    }
+    automaticQuery.sentEvent = event
+    automaticQuery.sentBlocked = blocked
+    automaticQuery.command = ["python3", Qt.resolvedUrl("apply.py").toString().replace("file://", ""),
+      "auto-check", JSON.stringify({ event: event, blocked: blocked })]
+    automaticQuery.running = true
+    autoCheckPending = false
+    autoEventPending = false
+    autoBlockPending = false
+    for (var j = 0; j < widgets.length; ++j) {
+      if (!widgets[j]) continue
+      widgets[j].autoCheckPending = false
+      widgets[j].autoEventPending = false
+      widgets[j].autoBlockPending = false
+    }
+  }
+  function acceptAutomationResult(result) {
+    var previous = autoResult
+    autoStatus = result.status || "failed"
+    autoMessage = result.message || ""
+    autoResult = result
+    var state = result.state || result.status
+    if (result.automatic && (!previous || previous.token !== result.token
+        || (previous.state || previous.status) !== state)
+        && (state === "pending" || state === "kept" || state === "reverted" || state === "failed")) {
+      Hyprland.refreshMonitors()
+      Hyprland.refreshWorkspaces()
+    }
+  }
+  Timer {
+    id: automaticTimer
+    onTriggered: root.checkAutomation()
+  }
+  Process {
+    id: automaticQuery
+    objectName: "automatic-profile-process"
+    property bool sentEvent: false
+    property bool sentBlocked: false
+    stdout: StdioCollector { id: automaticOutput; waitForEnd: true }
+    stderr: StdioCollector { waitForEnd: true }
+    onExited: function(code, status) {
+      root.completingAutomatic = true
+      var result
+      try {
+        result = JSON.parse(automaticOutput.text)
+        if (!result || typeof result.status !== "string") throw new Error("Invalid automation response")
+      } catch (error) {
+        // Do not poll after a broken response; retain the event for the next
+        // explicit wakeup or owner election rather than inventing a new one.
+        root.autoEventPending = root.autoEventPending || sentEvent
+        root.autoBlockPending = root.autoBlockPending || sentBlocked
+        result = { ok: false, status: "failed", message: "Could not read automatic restoration status. Open the panel to check for an active trial." }
+      }
+      var owner = root.cursorTracker
+      if (owner) owner.acceptAutomationResult(result)
+      Qt.callLater(function() {
+        root.completingAutomatic = false
+        var current = root.cursorTracker
+        if (!current) return
+        if (current !== root) root.handoffAutomation(current)
+        current.scheduleAutomationCheck(result.retryAfterMs)
+      })
     }
   }
 
@@ -157,7 +319,10 @@ BarWidget {
   Component.onCompleted: {
     refreshDisplayOrder()
     // Bar recreation can happen between the event and ownership registration.
-    if (cursorTracker === root) topologyRefresh.restart()
+    if (cursorTracker === root) {
+      topologyRefresh.restart()
+      requestAutomationCheck(false, false)
+    }
   }
   Connections {
     target: Hyprland.monitors

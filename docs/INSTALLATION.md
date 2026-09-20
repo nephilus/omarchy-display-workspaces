@@ -8,7 +8,7 @@
 - Hyprland with the Lua configuration/IPC API. Tested: 0.56.2.
 - Quickshell with Hyprland integration. Tested: 0.3.1.
 - Python 3, Git, and the normal Omarchy command dependencies such as `jq`.
-- A working systemd user manager (`systemd-run --user`) for independent preview/Forget workers.
+- A working systemd user manager (`systemd-run --user`) for independent preview, automatic-restoration, and Forget workers.
 - `hyprctl` and `notify-send` on PATH; Omarchy's usual Nerd Font for icons.
 
 The Python code has no third-party dependencies. The repository is installed directly; do not build it or run it as a standalone `quickshell -p` configuration.
@@ -85,9 +85,9 @@ Version 2.1 adds session-only resolution/refresh-rate and scale controls without
 
 Version 2.2 adds a **Profiles** tab without changing the plugin ID or presentation settings. Finish or revert active previews and wait for Forget to finish before updating: draft geometry now includes rotation for profile restoration. Restart the shell if the new tab is cached out.
 
-There is no migration or automatic profile creation. **Save current (new)** creates the store at `$XDG_CONFIG_HOME/display-workspaces/profiles.json` (normally `~/.config/display-workspaces/profiles.json`). It captures live geometry and workspace placement, not existing configuration rules or untested draft edits. No package or background service is added. Profiles load manually into the existing session-only preview flow.
+There is no automatic profile creation. In the current UI, **New → Save profile** creates the store at `$XDG_CONFIG_HOME/display-workspaces/profiles.json` (normally `~/.config/display-workspaces/profiles.json`). It captures live geometry and workspace placement, not existing configuration rules or untested draft edits. No package or background service is added. Profiles load manually into the existing session-only preview flow.
 
-The Profiles footer contains its own save/replace/delete/load actions and Cancel; Preview/Apply remain on Displays and Workspaces. This update also removes control recreation and temporary loading-row shifts when changing workspace display icons. Existing layout drafts and unrelated unfinished name edits stay intact.
+Profile management is separate from Preview/Apply, which remain on Displays and Workspaces. Version 2.2 also removes control recreation and temporary loading-row shifts when changing workspace display icons. Existing layout drafts and unrelated unfinished name edits stay intact.
 
 ## Upgrading from 2.2.0
 
@@ -100,6 +100,18 @@ Finish or revert active previews and wait for Forget to finish before updating. 
 Version 2.3 restores a profile's complete saved workspace set during Preview, including missing and empty workspaces. The draft identifies creations and empty-extra removals. Populated extras remain untouched; no windows are consolidated. Runtime-only persistence keeps saved workspaces available for the session and is covered by the independent rollback worker.
 
 Finish or revert active previews and wait for Forget before updating, then restart the shell to load the changed draft/worker contract. No profile-store, settings, or plugin-ID migration is required. Existing profiles now restore missing IDs rather than skipping them. Broad/named persistent rules and drafts leaving a display without a retained workspace fail closed; see [workspace restoration and recovery](USAGE.md#restoring-the-workspace-set).
+
+## Upgrading from 2.3
+
+Version 2.4 adds optional automatic restoration of explicitly trusted profiles. Existing profiles stay manual; no opt-in, display change, or profile-store write occurs merely from upgrading. Enable automation only after the saved arrangement is already live and physically checked. Each automatic profile needs a complete, unique make/model/serial identity set and at least one saved positive workspace on every enabled display. Only one automatic profile is allowed per combination.
+
+Finish/revert active previews and restorations and wait for Forget before updating, then restart the shell for the new controls and elected connection observer. The plugin ID and presentation settings do not change. No dependency or persistent service is added.
+
+The compact Profiles view uses **New** for naming/saving, **More** for updates/deletion, **Details** for compatibility and backup information, and **Review layout** for draft-only loading. **Restore automatically** reflects the saved opt-in only after confirmation succeeds. The UI refactor does not change backend safeguards or add another storage migration.
+
+Workspace-focus recovery uses one reconnecting native event subscription shared by the widget instances. Restart the shell after updating to load this repair; it adds no dependency or background service and does not change profile opt-ins. Recovery is limited to the widget's focus state, not the shared Quickshell event connection used by other shell features.
+
+Old schema-1 stores are read without modification. The next confirmed profile change writes schema 2 and backs up the exact old bytes. Versions through 2.3 refuse schema 2; preserve the current store and review an old-format backup before downgrading, without blindly discarding later profile changes. See [automatic restoration, manual precedence, and limits](USAGE.md#optional-automatic-restoration).
 
 ## Updating
 
@@ -117,9 +129,11 @@ If the UI remains cached after an update:
 omarchy restart shell
 ```
 
-Finish or revert any preview before updating, moving, or removing the plugin: detached workers can still be using its Python files.
+Finish or revert any preview or automatic restoration before updating, moving, or removing the plugin: detached workers can still be using its Python files.
 
 ## Disable or remove
+
+First revert any active automatic restoration or finish/revert a manual preview. Disabling the widget stops observation of new connections; it does not stop an already-started independent worker.
 
 Restore the stock widget first if desired:
 
@@ -151,5 +165,6 @@ omarchy-shell shell ping
 - **Duplicate plugin ID:** an existing `display.workspaces` installation must be migrated or updated, not installed a second time.
 - **Preview unavailable:** inspect the panel's reason. Geometry must be valid, the systemd user manager must work, and display changes require supported exact monitor declarations in the loaded `hypr.monitors` module. Refresh after a mode catalog changes; repair draft gaps/overlaps after changing resolution or scale.
 - **Profile unavailable:** all enabled displays must match without contradictory identities, and the saved mode/scale/layout must remain valid. Missing saved workspaces are restored on Preview; empty extras are removed and populated extras preserved. Broad/named persistent workspace rules can prevent safe Preview, and every enabled display needs a retained workspace. Read the reason; Detect displays refreshes it. A malformed, newer-version, or unsafe store requires manual review, not resetting it blindly.
+- **Automatic restoration unavailable or skipped:** automation requires explicit opt-in for a currently-live saved arrangement with unique nonempty make/model/serial identities. A matching complete combination, valid rollback baseline, advertised modes, and supported exact rules are still required. Read **Details** for the reason. Open panels/manual operations suppress that episode; close the panel and use manual Review layout/Preview/Apply, or wait for another genuine reconnect. Updating a profile disables its opt-in. A reported successful check cannot guarantee the physical screen is visible.
 - **Forget disabled:** dynamic/broad rules, ambiguous hardware identity, unsafe file ownership/permissions, or a stale catalog prevent destructive edits. Review the reason instead of bypassing it.
 - **Missing icons:** use the Nerd Font configured by Omarchy.

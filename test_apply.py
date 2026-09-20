@@ -2,6 +2,7 @@
 import contextlib
 import copy
 import json
+import os
 import re
 import unittest
 import tempfile
@@ -645,6 +646,364 @@ class LayoutSafetyTests(unittest.TestCase):
             errors = arrangement.rollback(state)
         self.assertTrue(any("moved externally" in error for error in errors))
         self.assertEqual(self.current["workspaces"][0]["monitor"], "B")
+
+
+class AutomaticRestorationTests(unittest.TestCase):
+    def setUp(self):
+        self.stack = contextlib.ExitStack()
+        self.addCleanup(self.stack.close)
+        directory = self.stack.enter_context(tempfile.TemporaryDirectory())
+        self.root = Path(directory)
+        self.stack.enter_context(patch.dict(os.environ, {
+            "XDG_CONFIG_HOME": directory, "XDG_RUNTIME_DIR": directory,
+            "HYPRLAND_INSTANCE_SIGNATURE": "isolated-automatic-tests"}))
+        raw = [{"id": index, "name": name, "make": "Synthetic", "model": name, "serial": name,
+                "width": 1920, "height": 1080, "scale": 1, "transform": 0, "refreshRate": 60,
+                "x": index * 1920, "y": 0, "availableModes": ["1920x1080@60Hz"]}
+               for index, name in enumerate(("A", "B"))]
+        with patch.object(arrangement, "query", side_effect=lambda kind, *args: {
+                "monitors": raw, "activewindow": {},
+                "workspaces": [{"id": 1, "monitor": "A", "windows": 1, "ispersistent": False},
+                               {"id": 2, "monitor": "B", "windows": 1, "ispersistent": False}]}[kind]):
+            self.current = arrangement.snapshot()
+        self.stack.enter_context(patch.object(arrangement, "snapshot", side_effect=lambda: copy.deepcopy(self.current)))
+        self.stack.enter_context(patch.object(arrangement, "run", return_value=""))
+        self.stack.enter_context(patch.object(arrangement.shutil, "which", return_value="/synthetic/tool"))
+        self.stack.enter_context(patch.object(arrangement, "require_exact_rules"))
+        self.rules = []
+        self.stack.enter_context(patch.object(arrangement, "workspace_rules", side_effect=lambda: copy.deepcopy(self.rules)))
+        self.stack.enter_context(patch.object(arrangement, "profile_status", return_value=set()))
+        self.stack.enter_context(patch.object(arrangement, "lua_eval"))
+        self.stack.enter_context(patch.object(arrangement, "announce_automatic"))
+        self.now = 100.0
+        self.stack.enter_context(patch.object(arrangement.time, "monotonic", side_effect=lambda: self.now))
+        self.profile = {"id": "a" * 32, "name": "Desk", "automatic": True,
+                        "monitors": [{"connector": m["name"],
+                                      **{key: m[key] for key in (*arrangement.display_profiles.IDENTITY,
+                                                                 *arrangement.display_profiles.GEOMETRY)}}
+                                     for m in self.current["monitors"]],
+                        "workspaces": [{"id": 1, "monitor": 0}, {"id": 2, "monitor": 1}]}
+        self.store = arrangement.display_profiles.store_path(create=True)
+        self.write_profiles([self.profile])
+        self.runtime = arrangement.runtime_dir()
+
+    def write_profiles(self, profiles):
+        self.store.write_text(json.dumps({"version": 2, "profiles": profiles}))
+        self.store.chmod(0o600)
+
+    def check(self, event=False, blocked=False):
+        return arrangement.display_automation.check(arrangement, {"event": event, "blocked": blocked})
+
+    def start(self):
+        self.assertEqual(self.check()["status"], "settling")
+        self.now += 2
+        result = self.check()
+        self.assertEqual(result["status"], "starting", result)
+        return result["token"]
+
+    def finish(self, token):
+        state = arrangement.load(self.runtime, token)
+        state.update(state="kept", phase="finished")
+        arrangement.save(self.runtime, state)
+
+    def run_worker(self, token, on_tick=None):
+        def apply_profile(state):
+            for workspace in self.current["workspaces"]:
+                workspace["ispersistent"] = True
+            self.rules = arrangement.expected_profile_rules(state, set())
+
+        def rollback(state):
+            self.current = copy.deepcopy(state["baseline"])
+            self.rules = copy.deepcopy(state["profileJournal"]["beforeRules"])
+            return []
+
+        def sleep(seconds):
+            self.now = round(self.now + seconds, 6)
+            if on_tick:
+                on_tick()
+
+        with patch.object(arrangement, "apply_profile", side_effect=apply_profile), \
+                patch.object(arrangement, "rollback", side_effect=rollback), \
+                patch.object(arrangement.time, "sleep", side_effect=sleep):
+            arrangement.worker(self.runtime, token)
+        return arrangement.load(self.runtime, token)
+
+    def test_bursts_settle_handoff_deduplicates_and_same_combination_can_reconnect(self):
+        self.assertEqual(self.check()["retryAfterMs"], 2000)
+        self.now = 101.5
+        self.assertEqual(self.check(event=True)["status"], "settling")
+        # Paired monitoradded/monitoraddedv2 delivery extends the same burst.
+        self.now = 101.6
+        self.assertEqual(self.check(event=True)["status"], "settling")
+        self.now = 103.59
+        self.assertEqual(self.check()["status"], "settling")
+        self.now = 103.6
+        first = self.check()
+        self.assertEqual(first["status"], "starting")
+        self.assertEqual(self.check()["token"], first["token"])
+        self.assertEqual(self.check(event=True)["token"], first["token"])
+        self.finish(first["token"])
+        # Geometry, workspace focus/order, and refreshes do not enforce the profile.
+        self.current["monitors"].reverse()
+        for monitor in self.current["monitors"]:
+            monitor["x"] += 30
+            monitor["focused"] = True
+        self.current["workspaces"][0]["monitor"] = "B"
+        self.now = 120
+        self.assertEqual(self.check()["status"], "kept")
+        self.assertEqual(self.check(event=True)["status"], "settling")
+        self.now += 2
+        second = self.check()
+        self.assertEqual(second["status"], "starting", second)
+        self.assertNotEqual(first["token"], second["token"])
+
+    def test_topology_availability_changes_extend_pending_settling(self):
+        self.check(event=True)
+        self.now += 1
+        self.current["unavailableMonitors"] = [{"name": "C", "make": "Synthetic", "model": "C", "serial": "C"}]
+        self.assertEqual(self.check()["retryAfterMs"], 2000)
+        self.now += 2
+        result = self.check()
+        self.assertEqual(result["status"], "skipped")
+        self.assertIn("unavailable", result["message"])
+        self.current["unavailableMonitors"] = []
+        self.now += 10
+        self.assertEqual(self.check()["status"], "skipped")
+
+    def test_open_panel_consumes_episode_and_closing_does_not_restore(self):
+        self.check()
+        self.now += 1
+        self.assertEqual(self.check(blocked=True)["status"], "skipped")
+        self.now += 10
+        self.assertEqual(self.check()["status"], "skipped")
+        self.assertEqual(self.check(event=True)["status"], "settling")
+        self.now += 2
+        self.assertEqual(self.check()["status"], "starting")
+
+    def test_manual_begin_cannot_grant_automatic_and_suppresses_connection(self):
+        self.check()
+        draft = arrangement.display_automation.request_for(arrangement, self.profile, self.current)
+        draft.update(automatic=True, automaticProfile={"id": self.profile["id"]})
+        trial = arrangement.begin(draft)
+        self.assertFalse(trial["automatic"])
+        self.now += 5
+        self.assertEqual(self.check(event=True)["status"], "skipped")
+        self.finish(trial["token"])
+        self.now += 10
+        self.assertEqual(self.check()["status"], "skipped")
+
+    def test_profile_load_and_forget_suppress_pending_episode(self):
+        self.check()
+        request = {"id": self.profile["id"], "revision": arrangement.display_config.digest(self.store.read_bytes())}
+        with patch.object(arrangement.sys, "argv", ["apply.py", "profile-load", json.dumps(request)]):
+            self.assertTrue(arrangement.main()["ok"])
+        self.now += 5
+        self.assertEqual(self.check()["status"], "skipped")
+        self.check(event=True)
+        with patch.object(arrangement.display_config, "prepare", side_effect=ValueError("stale selection")):
+            with self.assertRaisesRegex(ValueError, "stale selection"):
+                arrangement.forget({})
+        self.now += 5
+        self.assertEqual(self.check()["status"], "skipped")
+
+    def test_active_auto_remains_observable_while_blocked_and_discovery_fails(self):
+        token = self.start()
+        with patch.object(arrangement, "snapshot", side_effect=ValueError("IPC unavailable")):
+            result = self.check(event=True, blocked=True)
+        self.assertTrue(result["automatic"])
+        self.assertEqual(result["token"], token)
+        self.assertEqual(result["profileName"], "Desk")
+        self.assertGreater(result["retryAfterMs"], 0)
+        self.finish(token)
+        self.now += 10
+        self.assertEqual(self.check()["status"], "kept")
+
+    def test_missing_weak_conflicting_and_unsupported_profiles_never_launch(self):
+        cases = []
+        disabled = copy.deepcopy(self.profile)
+        disabled["automatic"] = False
+        cases.append([disabled])
+        weak = copy.deepcopy(self.profile)
+        weak["monitors"][0]["serial"] = ""
+        cases.append([weak])
+        conflict = copy.deepcopy(self.profile)
+        conflict.update(id="b" * 32, name="Other")
+        cases.append([self.profile, conflict])
+        unavailable = copy.deepcopy(self.profile)
+        unavailable["monitors"][0].update(width=1600, height=900)
+        cases.append([unavailable])
+        for profiles in cases:
+            with self.subTest(profiles=profiles):
+                self.write_profiles(profiles)
+                self.now += 10
+                self.assertEqual(self.check(event=True)["status"], "settling")
+                self.now += 2
+                self.assertEqual(self.check()["status"], "skipped")
+                self.assertFalse((self.runtime / "active.json").exists())
+                self.now += 10
+                self.assertEqual(self.check()["status"], "skipped")
+
+    def test_renamed_connector_does_not_bypass_exact_rule_preflight(self):
+        self.profile["monitors"][0]["x"], self.profile["monitors"][1]["x"] = 1920, 0
+        self.write_profiles([self.profile])
+        self.current["monitors"][0]["name"] = "renamed-A"
+        self.current["workspaces"][0]["monitor"] = "renamed-A"
+        self.check()
+        self.now += 2
+        with patch.object(arrangement, "require_exact_rules", side_effect=ValueError("No safe exact monitor rule")):
+            result = self.check()
+        self.assertEqual(result["status"], "skipped")
+        self.assertIn("No safe exact monitor rule", result["message"])
+        self.assertFalse((self.runtime / "active.json").exists())
+
+    def test_worker_rechecks_revision_and_disable_before_mutation(self):
+        for enabled in (False, True):
+            with self.subTest(enabled=enabled):
+                self.write_profiles([self.profile])
+                self.now += 10
+                self.check(event=True)
+                self.now += 2
+                token = self.check()["token"]
+                modified = copy.deepcopy(self.profile)
+                modified.update(automatic=enabled, name="Changed")
+                self.write_profiles([modified])
+                before = copy.deepcopy(self.current)
+                arrangement.worker(self.runtime, token)
+                result = arrangement.load(self.runtime, token)
+                self.assertEqual(result["state"], "failed")
+                self.assertFalse(result["mutationStarted"])
+                self.assertEqual(self.current, before)
+
+    def test_automatic_revert_preserves_workspace_move_during_worker_startup(self):
+        token = self.start()
+        # The launcher saw A; the user moved this workspace before the worker ran.
+        self.current["workspaces"][0]["monitor"] = "B"
+        observed = []
+
+        def execute(code):
+            # Emulate only compositor side effects; use the real worker and rollback.
+            for wid, target in re.findall(
+                    r'hl\.workspace_rule\(\{workspace="(\d+)",monitor="([^"]+)",persistent=true\}\)', code):
+                self.rules.append({"workspaceString": wid, "enabled": True,
+                                   "persistent": True, "monitor": target})
+                workspace = next(w for w in self.current["workspaces"] if w["id"] == int(wid))
+                workspace.update(monitor=target, ispersistent=True)
+            for wid in re.findall(r'j\.pins\["(\d+)"\]:set_enabled\(false\)', code):
+                for rule in self.rules:
+                    if rule["workspaceString"] == wid:
+                        rule["enabled"] = False
+                next(w for w in self.current["workspaces"] if w["id"] == int(wid))["ispersistent"] = False
+            for wid, target in re.findall(
+                    r'hl\.dsp\.workspace\.move\(\{workspace=(\d+),monitor="([^"]+)"\}\)', code):
+                next(w for w in self.current["workspaces"] if w["id"] == int(wid))["monitor"] = target
+
+        def revert(seconds):
+            self.now += seconds
+            if arrangement.load(self.runtime, token)["state"] == "pending":
+                observed.append(self.current["workspaces"][0]["monitor"])
+                arrangement.control("revert", token)
+
+        with patch.object(arrangement, "lua_eval", side_effect=execute), \
+                patch.object(arrangement.time, "sleep", side_effect=revert):
+            arrangement.worker(self.runtime, token)
+        self.assertEqual(observed, ["A"])
+        self.assertEqual(arrangement.load(self.runtime, token)["state"], "reverted")
+        self.assertEqual(self.current["workspaces"][0]["monitor"], "B")
+        self.assertEqual(self.current["workspaces"][1]["monitor"], "B")
+
+    def test_auto_observes_full_deadline_and_keep_cannot_shorten_it(self):
+        token = self.start()
+        started = self.now
+        attempts = []
+
+        def keep_early():
+            if not attempts:
+                resumed = arrangement.resume()
+                self.assertTrue(resumed["automatic"])
+                self.assertEqual(resumed["profileName"], "Desk")
+                self.assertEqual(resumed["secondsRemaining"], 20)
+                attempts.append(arrangement.control("keep", token))
+
+        result = self.run_worker(token, keep_early)
+        self.assertFalse(attempts[0]["ok"])
+        self.assertEqual(result["state"], "kept")
+        self.assertGreaterEqual(self.now - started, 20)
+        self.assertTrue(all(w["ispersistent"] for w in self.current["workspaces"]))
+        self.assertNotIn("retryAfterMs", self.check())
+
+    def test_manual_trial_still_requires_apply_and_expires(self):
+        draft = arrangement.display_automation.request_for(arrangement, self.profile, self.current)
+        token = arrangement.begin(draft)["token"]
+        before = copy.deepcopy(self.current)
+        result = self.run_worker(token)
+        self.assertEqual(result["state"], "reverted")
+        self.assertEqual(self.current, before)
+        token = arrangement.begin(draft)["token"]
+
+        def keep():
+            arrangement.control("keep", token)
+
+        started = self.now
+        result = self.run_worker(token, keep)
+        self.assertEqual(result["state"], "kept")
+        self.assertLess(self.now - started, 20)
+
+    def test_auto_verification_failure_reverts_and_does_not_retry(self):
+        token = self.start()
+        before = copy.deepcopy(self.current)
+        started = self.now
+
+        def external_change():
+            if self.now - started >= 5:
+                self.current["workspaces"][0]["ispersistent"] = False
+
+        result = self.run_worker(token, external_change)
+        self.assertEqual(result["state"], "failed")
+        self.assertEqual(self.current, before)
+        self.now += 10
+        self.assertEqual(self.check()["token"], token)
+        self.assertEqual(self.check()["status"], "failed")
+
+    def test_profile_disabled_externally_during_countdown_rolls_back_at_commit(self):
+        token = self.start()
+        before = copy.deepcopy(self.current)
+        started = self.now
+        changed = False
+
+        def disable():
+            nonlocal changed
+            if not changed and self.now - started >= 5:
+                changed = True
+                profile = copy.deepcopy(self.profile)
+                profile["automatic"] = False
+                self.write_profiles([profile])
+
+        result = self.run_worker(token, disable)
+        self.assertEqual(result["state"], "failed")
+        self.assertEqual(self.current, before)
+        self.assertGreaterEqual(self.now - started, 20)
+        self.assertFalse(json.loads(self.store.read_text())["profiles"][0]["automatic"])
+
+    def test_automatic_revert_and_worker_restart_never_keep_or_reapply(self):
+        for restart in (False, True):
+            with self.subTest(restart=restart):
+                self.now += 10
+                self.check(event=True)
+                self.now += 2
+                token = self.check()["token"]
+                baseline = copy.deepcopy(self.current)
+                if restart:
+                    state = arrangement.load(self.runtime, token)
+                    state.update(state="pending", phase="waiting", mutationStarted=True,
+                                 request="keep", deadline=self.now + 20)
+                    arrangement.save(self.runtime, state)
+                    self.current["workspaces"][0]["ispersistent"] = True
+                    result = self.run_worker(token)
+                    self.assertEqual(result["state"], "failed")
+                else:
+                    result = self.run_worker(token, lambda: arrangement.control("revert", token))
+                    self.assertEqual(result["state"], "reverted")
+                self.assertEqual(self.current, baseline)
 
 
 if __name__ == "__main__":
