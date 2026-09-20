@@ -11,7 +11,7 @@ import json
 
 import configuration as config
 
-VERSION = 1
+VERSION = 2
 MAX_BYTES = 2 * 1024 * 1024
 MAX_PROFILES = 128
 MAX_MONITORS = 32
@@ -114,16 +114,19 @@ def number(value, label, minimum, maximum, integer=False):
         raise ValueError(f"Invalid {label} in profile store.")
 
 
-def validate_document(document):
+def validate_document(document, legacy=False):
     fields(document, ("version", "profiles"), "document")
-    if type(document["version"]) is not int or document["version"] != VERSION:
+    if type(document["version"]) is not int or document["version"] not in ((1, VERSION) if legacy else (VERSION,)):
         raise ValueError("Unsupported profile store version; nothing was changed.")
     records = document["profiles"]
     if not isinstance(records, list) or len(records) > MAX_PROFILES:
         raise ValueError("Invalid profile list or too many profiles.")
-    ids, names = set(), set()
+    ids, names, automatic_keys = set(), set(), set()
     for profile in records:
-        fields(profile, ("id", "name", "monitors", "workspaces"), "profile")
+        expected = ("id", "name", "monitors", "workspaces")
+        fields(profile, expected if document["version"] == 1 else (*expected, "automatic"), "profile")
+        if document["version"] != 1 and type(profile["automatic"]) is not bool:
+            raise ValueError("Invalid automatic flag in profile store.")
         if not isinstance(profile["id"], str) or not ID.fullmatch(profile["id"]) or profile["id"] in ids:
             raise ValueError("Invalid or duplicate profile ID.")
         name = text(profile["name"], "profile name", 80, False)
@@ -161,6 +164,12 @@ def validate_document(document):
             if workspace["id"] in workspace_ids:
                 raise ValueError("Duplicate profile workspace ID.")
             workspace_ids.add(workspace["id"])
+        if profile.get("automatic", False):
+            key = automation_key(profile)
+            require_workspace_coverage(profile)
+            if key in automatic_keys:
+                raise ValueError("Only one automatic profile is allowed for each hardware combination.")
+            automatic_keys.add(key)
     return document
 
 
@@ -169,7 +178,12 @@ def document_from(data):
         return {"version": VERSION, "profiles": []}
     try:
         document = json.loads(data, object_pairs_hook=config.strict_object)
-        return validate_document(document)
+        validate_document(document, legacy=True)
+        if document["version"] == 1:
+            document["version"] = VERSION
+            for profile in document["profiles"]:
+                profile["automatic"] = False
+        return document
     except (UnicodeError, RecursionError, json.JSONDecodeError) as error:
         raise ValueError("Malformed profile store; repair it manually before continuing.") from error
 
@@ -191,6 +205,41 @@ def require_supported(api, current):
 def identity(monitor):
     return tuple(text("" if monitor.get(key) is None else monitor[key], "monitor " + key)
                  for key in IDENTITY)
+
+
+def automation_key(profile):
+    """Canonical unordered hardware set; never accept connector-dependent proof."""
+    monitors = profile.get("monitors")
+    if not isinstance(monitors, list) or not 1 <= len(monitors) <= MAX_MONITORS:
+        raise ValueError("Automatic restoration needs a complete enabled display combination.")
+    keys = [identity(monitor) for monitor in monitors]
+    if any(not all(key) for key in keys) or len(set(keys)) != len(keys):
+        raise ValueError("Automatic restoration requires unique, nonempty make/model/serial identities; weak matches are manual-only.")
+    return json.dumps(sorted(keys), ensure_ascii=False, separators=(",", ":"))
+
+
+def require_workspace_coverage(profile):
+    if {workspace["monitor"] for workspace in profile["workspaces"]} != set(range(len(profile["monitors"]))):
+        raise ValueError("Automatic restoration requires at least one saved positive workspace on every display.")
+
+
+def require_automatic_live(api, profile, document, current):
+    key = automation_key(profile)
+    require_workspace_coverage(profile)
+    if any(other["id"] != profile["id"] and other["automatic"] and automation_key(other) == key
+           for other in document["profiles"]):
+        raise ValueError("Another automatic profile already owns this hardware combination. Disable it first.")
+    live = require_supported(api, current)
+    if automation_key({"monitors": live}) != key:
+        raise ValueError("The saved hardware combination is not currently connected.")
+    mapping, _ = match_monitors(api, profile, current)
+    if any(not api.same_fields(monitor, mapping[index], GEOMETRY)
+           for index, monitor in enumerate(profile["monitors"])):
+        raise ValueError("Load, Preview and Apply this profile first; its saved display geometry is not live.")
+    current_placements = placements(api, current)
+    if any(current_placements.get(workspace["id"]) != mapping[workspace["monitor"]]["name"]
+           for workspace in profile["workspaces"]):
+        raise ValueError("Load, Preview and Apply this profile first; its saved workspace placements are not live.")
 
 
 def match_monitors(api, profile, current):
@@ -277,11 +326,26 @@ def listing(api, document, data, current=None, error=None):
                 can_load = True
             except (ValueError, KeyError, TypeError) as failure:
                 match, reason = "unavailable", str(failure)
+        can_automate, automatic_reason = False, error
+        try:
+            # Explain stored identity/coverage problems even while disconnected.
+            automation_key(profile)
+            require_workspace_coverage(profile)
+            if current is not None:
+                if not can_load:
+                    raise ValueError(reason)
+                require_automatic_live(api, profile, document, current)
+                can_automate = True
+                automatic_reason = "Saved geometry and workspace placements are live; this strong hardware combination can restore automatically."
+        except (ValueError, KeyError, TypeError) as failure:
+            automatic_reason = str(failure)
         entries.append({"id": profile["id"], "name": profile["name"],
                         "displayCount": len(profile["monitors"]), "workspaceCount": len(profile["workspaces"]),
-                        "canLoad": can_load, "match": match, "reason": reason})
+                        "canLoad": can_load, "match": match, "reason": reason,
+                        "automatic": profile["automatic"], "canAutomate": can_automate,
+                        "automaticReason": automatic_reason or "Live displays are unavailable."})
     return {"ok": True, "revision": config.digest(data), "profiles": entries,
-            "message": error or "Saved profiles loaded. Choose a profile manually; nothing is applied automatically."}
+            "message": error or "Saved profiles loaded. Only explicitly enabled profiles restore automatically."}
 
 
 def catalog(api):
@@ -375,7 +439,7 @@ def save(api, request):
             if connector not in indices:
                 raise ValueError(f"Workspace {wid} belongs to an unavailable display.")
             workspaces.append({"id": wid, "monitor": indices[connector]})
-        profile = {"id": replacing["id"] if replacing else secrets.token_hex(16), "name": name,
+        profile = {"id": replacing["id"] if replacing else secrets.token_hex(16), "name": name, "automatic": False,
                    "monitors": [{**dict(zip(IDENTITY, identity(m))), "connector": m["name"],
                                  **{key: m[key] for key in GEOMETRY}} for m in monitors],
                    "workspaces": sorted(workspaces, key=lambda workspace: workspace["id"])}
@@ -400,6 +464,33 @@ def delete(api, request):
         data, backups = write_document(path, original, document)
         result = listing(api, document, data)
         result.update(backupPaths=backups, message=f"Deleted profile {profile['name']}. Live displays were not changed.")
+        return result
+
+
+def set_automatic(api, request):
+    with locked_store() as path:
+        original = read_store(path)
+        document = document_from(original)
+        check_request(request, original, ("id", "revision", "enabled"))
+        if type(request["enabled"]) is not bool:
+            raise ValueError("Automatic restoration must be explicitly enabled or disabled.")
+        profile = selected(document, request)
+        current = None
+        if request["enabled"]:
+            current = api.snapshot()
+            draft_for(api, profile, current)
+            require_automatic_live(api, profile, document, current)
+            # Recheck the observed live state before committing the trust decision.
+            fresh = api.snapshot()
+            api.compare_outputs(current, fresh, catalog=True)
+            require_automatic_live(api, profile, document, fresh)
+            current = fresh
+        profile["automatic"] = request["enabled"]
+        data, backups = write_document(path, original, document)
+        result = listing(api, document, data, current)
+        action = "Enabled" if request["enabled"] else "Disabled"
+        result.update(backupPaths=backups,
+                      message=f"{action} automatic restoration for {profile['name']}. Live displays were not changed.")
         return result
 
 

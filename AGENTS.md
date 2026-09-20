@@ -4,29 +4,32 @@
 
 Omarchy Display Workspaces is a third-party Quickshell bar widget and compact display/workspace arrangement panel. Its public ID, QML module/IPC identity, and settings key are **`display.workspaces`**. Never use a developer username or homelab name as product identity. The `omarchy.*` namespace is first-party; `omarchy.workspaces` references that remain here identify the stock widget or upstream provenance.
 
-Keep the product narrow: multi-display workspace visibility, straightforward session arrangement with advertised resolution/refresh and scale controls, manual named live-arrangement profiles, immediate presentation preferences, and deliberate configuration cleanup. Do not add automatic profile switching, rotation editing, HDR controls, dependencies, telemetry, or background services without a request.
+Keep the product narrow: multi-display workspace visibility, straightforward session arrangement with advertised resolution/refresh and scale controls, named live-arrangement profiles with optional strong-identity reconnect restoration, immediate presentation preferences, and deliberate configuration cleanup. Do not add automatic layout learning, individual-window tracking, rotation editing, HDR controls, dependencies, telemetry, or persistent background services without a request.
 
 Read `README.md`, `docs/INSTALLATION.md`, and `docs/USAGE.md` before behavior changes. Follow `docs/AGENTS.md` when editing documentation or screenshots.
 
 ## Architecture
 
 - `manifest.json`: native Omarchy package identity and entry point; must remain at repository root for URL installation.
-- `Workspaces.qml`: per-display bar groups, elected cursor polling, identity matching, native shell preference persistence.
+- `Workspaces.qml`: per-display bar groups, elected cursor polling/connection observation, identity matching, native shell preference persistence.
+- `HyprlandEventStream.qml`: elected reconnecting focus-event transport; reconnects resynchronize focus without replaying profile automation.
 - `ArrangePanel.qml`: draft layout/workspace state, catalog, confirmation, validation generations, worker responses.
 - `ArrangePopup.qml`, `DisplayMap.qml`: native popup and display geometry UI.
 - `apply.py`: discovery, validation, independent systemd preview/Forget workers, and runtime transaction state.
 - `configuration.py`: nonexecuting Lua scanner, configuration/preference catalog, revisions, exact backups and guarded restoration.
 - `profiles.py`: versioned private profile store, guarded CRUD, hardware matching, and draft-only loading.
+- `automation.py`: per-session settled connection episodes, guarded automatic selection, and immutable unattended authorization.
 - `test_apply.py`, `test_configuration.py`, `test_profiles.py`: isolated Python behavioral regression coverage.
 
 There is no build step. Reuse Omarchy's host QML components and Python's standard library.
 
 ## Safety invariants
 
-- **Preview/Apply is session-only.** Keep the 20-second confirmation deadline and independent rollback worker. Never silently persist layout changes.
+- **Display/workspace changes are session-only.** Manual Preview requires Apply within 20 seconds. Explicitly opted-in automatic restoration keeps only after its full 20-second health observation and authorization recheck. Both use the independent rollback worker; never silently persist Hyprland layout rules.
 - Mode/scale edits belong to the same complete draft transaction as positions. Validate advertised modes and whole logical pixels; preserve the original timing for an unchanged custom mode. Rollback may restore original geometry only when the live geometry still matches the original or intended target; preserve unrelated external changes.
-- Profiles save current live state, never untested draft edits, and load only into a draft. Match all enabled displays one-to-one; conflicting nonempty identities must never fall back to the same connector. Weak matches require an explicit warning. Preview must create and retain all saved positive workspace IDs, retire only atomically verified empty extras, and preserve populated/unknown-count extras and special workspaces. Runtime persistence and empty cleanup belong to the independent rollback transaction; preserve unrelated rule fields and external edits. Keep presentation settings separate.
-- Profile replacement/deletion requires immutable ID/revision confirmation and exact backups before atomic writes. Refuse corrupt/unknown schemas and unsafe paths; never reset the store silently. Serialize storage across compositor sessions and block profile operations during preview/Forget.
+- Profiles save current live state, never untested draft edits. Manual loading only prepares a draft. Match all enabled displays one-to-one; conflicting nonempty identities must never fall back to the same connector. Weak matches require an explicit warning and are never automatic. Restoration must create and retain all saved positive workspace IDs, retire only atomically verified empty extras, and preserve populated/unknown-count extras and special workspaces. Runtime persistence and empty cleanup belong to the independent rollback transaction; preserve unrelated rule fields and external edits. Keep presentation settings separate.
+- Profile replacement/deletion and automation opt-in require immutable ID/revision confirmation and exact backups before atomic writes. New/replaced profiles are manual. Read schema 1 without writing, migrate only on guarded writes, and never infer consent. Refuse corrupt/unknown schemas and unsafe paths; never reset the store silently. Serialize storage across compositor sessions and block profile operations during preview/automatic restoration/Forget.
+- Automation needs a unique complete strong identity set, one enabled profile per combination, and a currently-live saved arrangement at opt-in. Settle actual connection changes; consume attempts before launch and suppress episodes for open panels/manual operations. No continual enforcement, idle polling, or guessing on weak/no/multiple matches. Guard store authorization before mutation and unattended keep; restart recovers rather than reapplies. Runtime lock precedes profile-store lock.
 - Names/icons/order save separately through native shell APIs. Preserve disconnected display preferences and unrelated settings.
 - **Forget is destructive.** Require immutable key/revision confirmation; back up changed files before atomic writes. Validate reload/configuration errors. Preserve concurrent external edits during recovery.
 - Keep preview and Forget mutually exclusive. Worker lifetime must not depend on the panel remaining alive.

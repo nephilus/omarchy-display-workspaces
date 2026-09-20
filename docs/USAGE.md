@@ -6,6 +6,8 @@
 
 Right-click a display label to open the arrangement panel. The green display highlight follows the cursor; it is not a substitute for keyboard/workspace focus indicators.
 
+The green workspace number and underline follow keyboard focus independently of the cursor's display highlight. One elected widget maintains a reconnecting native event subscription and refreshes focus after reconnection or relevant events; it does not continuously poll focus. This recovers the indicator if Quickshell's shared Hyprland event connection drops. It does not replay automatic profiles or repair the shared connection for other shell features.
+
 In **Workspaces**, edit a display's name or choose a curated Nerd Font icon. Use the ordering controls to change the presentation order. These preferences save immediately in the `display.workspaces` bar entry in `~/.config/omarchy/shell.json`; they do not require Preview or Apply.
 
 Name and icon changes update the existing workspace controls in place, preserving draft workspace moves and unfinished edits in other display-name fields. Background catalog refreshes do not insert a temporary loading row once the catalog is available.
@@ -23,7 +25,7 @@ Use **Displays** to select a display on the map, choose its advertised resolutio
 3. Check the live result.
 4. Click **Apply** within the countdown to keep it, or cancel/wait to revert.
 
-Apply keeps resolution, scale, rotation, and arrangement **for this session only**. It does not persist display settings or workspace bindings into Hyprland configuration. Reloading configuration or restarting the session can reapply your existing rules. Profiles are saved separately and never load automatically. The plugin does not provide automatic mode/scale selection, custom modelines, rotation editing, or HDR controls.
+Apply keeps resolution, scale, rotation, and arrangement **for this session only**. It does not persist display settings or workspace bindings into Hyprland configuration. Reloading configuration or restarting the session can reapply your existing rules. Profiles are saved separately; automatic restoration is off unless explicitly enabled for a profile. The plugin does not provide automatic mode/scale selection, custom modelines, rotation editing, or HDR controls.
 
 Resolution choices come from the display's advertised modes. Refresh rates remain distinct, such as 59.94 Hz and 60 Hz. An active custom/unadvertised mode can be retained; if no modes are advertised, resolution selection is disabled rather than guessed.
 
@@ -39,16 +41,18 @@ When an output reports zero size or other invalid geometry, healthy displays and
 
 ## Manual profiles
 
-A profile is a named snapshot of the **current live arrangement**, not a saved draft or an automatic rule. It records all enabled displays' hardware identities, resolution/refresh rate, scale, rotation, coordinates, and positive workspace IDs with their display placements. Names, icons, and bar order remain separate presentation preferences.
+A profile is a named snapshot of the **current live arrangement**, not a saved draft or an automatically learned layout. It records all enabled displays' hardware identities, resolution/refresh rate, scale, rotation, coordinates, and positive workspace IDs with their display placements. Names, icons, and bar order remain separate presentation preferences. Profiles start manual; automatic restoration requires a separate opt-in.
 
 1. Arrange the live session as desired. If you edited a draft, Preview and Apply it first, then reopen the panel.
-2. Open **Profiles**, enter a unique name (up to 80 characters), and click **Save current (new)**. Saving never applies draft edits.
-3. Later, select that profile and check its compatibility message. Click **Load into draft**. If you have display or workspace draft edits, confirm discarding them—or cancel to preserve them.
+2. Open **Profiles → New**, enter a unique name (up to 80 characters), and click **Save profile**. Saving never applies draft edits.
+3. Later, select that profile and check its compatibility status. **Details** expands the full reason; a port-dependent match keeps a visible warning. Click **Review layout**. If you have display or workspace draft edits, confirm discarding them—or cancel to preserve them.
 4. Review the loaded Displays map and Workspaces cards, then **Preview (20s) → Apply**. Loading alone changes neither live displays nor files.
 
-The **Profiles** footer contains Save current, Replace selected, Delete selected, Load into draft, and Cancel instead of Preview/Apply. During confirmation it shows the confirmation action and Cancel; Cancel dismisses the confirmation without closing the panel. Preview/Apply remain on Displays and Workspaces.
+The resting **Profiles** view shows the selector, **New**, **More**, compatibility summary, and **Restore automatically** switch, with **Close** and **Review layout** in the footer. Naming fields appear only for New or Update from current. **Cancel** dismisses a form or confirmation without closing the panel; **Close** dismisses the idle panel. Manual Preview/Apply remain on Displays and Workspaces.
 
-**Replace selected** captures the current live arrangement again, optionally under the edited name. It is not a rename-only operation. **Delete selected** removes only that saved profile. Both require a second confirmation tied to the selected profile and store revision. Neither changes live displays or the existing draft. Preview and Forget must finish before saving, replacing, deleting, or loading a profile.
+**More → Update from current…** opens a name field, then **Review update → Confirm update** captures the current live arrangement again and **disables automatic restoration** for that profile. It is not a rename-only operation. **More → Delete… → Confirm delete** removes only that saved profile, including its opt-in. Both confirmations are tied to the selected profile and store revision. Neither changes live displays or the existing draft. Preview, automatic restoration, and Forget must finish before saving, updating, deleting, loading, or changing a profile's opt-in.
+
+Successful operations show a brief status; errors remain visible. **Details** retains the last profile operation's full feedback and backup paths after its success message disappears.
 
 ### Restoring the workspace set
 
@@ -73,15 +77,43 @@ Retention and cleanup use runtime-only workspace rules. No configuration files a
 - Stored rotations are restored through the same preview transaction; there is no rotation editor. Loading normalizes the common origin without changing relative positions.
 - A hardware match does not bypass Preview's rule preflight: live display changes still require supported exact connector rules in the loaded `hypr.monitors` module, including after port renaming.
 
-Unavailable profiles stay listed with a reason and can be deleted without matching that display combination. Use **Detect displays** after an external display or configuration change. No automatic selection, hotplug application, login restoration, or new background service is added.
+Unavailable profiles stay listed with a reason and can be deleted or have automation disabled without matching that display combination. Use **Detect displays** after an external display or configuration change.
 
-### Storage and profile recovery
+## Optional automatic restoration
+
+Automatic restoration uses your explicit saved profiles, not a history of temporary arrangements or individual application-window positions.
+
+1. Save the current live arrangement, or use Review layout, Preview and Apply on an existing profile so its saved geometry and positive workspace placements are already live.
+2. Select it in **Profiles** and turn on **Restore automatically**. Every enabled display must have a unique, nonempty make/model/serial identity and at least one saved positive workspace. Only one automatic profile is allowed per unordered hardware combination; disable the other profile first if necessary. **Details** explains why the switch is unavailable.
+3. Read the warning and choose **Turn on**. The switch changes only after the confirmed save succeeds; Cancel leaves it off. This authorizes future changes **without another Apply click**. It does not change the current layout or immediately restore the profile.
+4. On a subsequent matching reconnect, or the plugin's initial check in a new compositor session, connections must settle for at least two seconds before restoration starts.
+5. The independent worker validates and restores the saved arrangement, then observes it for **20 seconds**. If checks continue to pass and the opt-in is unchanged, it automatically keeps the result for this session. Manual Apply cannot shorten this observation.
+
+The worker sends countdown and completion/failure notifications. It does not force the panel open. To cancel, open the arrangement panel and choose **Revert** during the countdown; the panel can be dismissed without stopping the worker. A failure, interruption, or changed profile authorization causes guarded rollback rather than automatic keep. This is not proof the user can see a screen: a compositor may report success despite a display/cable problem. Enable only an arrangement you have checked physically.
+
+### Connection cases and manual precedence
+
+- **Matching dock/displays:** restore the sole enabled profile for the complete strong hardware combination. Connector renaming is supported, subject to exact-rule and mode validation.
+- **Laptop-only or another combination:** restore only if that complete combination has its own enabled profile. Otherwise leave the compositor's arrangement alone.
+- **Staggered reconnects or sleep-related disconnects:** each observed connection change extends settling. Two seconds of quiet is a debounce, not a guarantee that a slow dock has finished. Another change during restoration fails the transaction safely where recovery is possible. Waking without a connection event does not force reapplication.
+- **Different hardware on the same port, weak identities, invalid geometry/modes, or unsupported rules:** skip with a reason rather than guess. The existing live arrangement must itself be a valid rollback baseline.
+- **Open arrangement panel, manual Preview/Apply, profile operation, or Forget:** skip the current connection episode. Closing the panel or completing the manual operation does not replay it unexpectedly. An already-started automatic worker remains inspectable and revertible.
+- **Manual edits afterward:** leave them alone. There is no continual enforcement, automatic profile replacement, or learning from live changes. Configuration reload alone does not trigger restoration.
+- **Failure, skip, or shell/widget recreation:** no repeated attempt for that episode. A later genuine connection event can try again. Per-session claims prevent duplicate restores when the elected bar widget changes.
+
+The existing widget observes events; no persistent service is installed. It must be enabled and the shell running to detect new connections. Already-started workers survive the widget or shell exiting. All display/workspace effects remain runtime-only; enabling automation persists permission to restore the saved profile in future sessions, not Hyprland monitor rules.
+
+Turning **Restore automatically** off also requires confirmation and works even when the saved displays are disconnected. Revert an active restoration first. Updating the profile disarms it; re-enable only after reviewing the replacement live arrangement.
+
+## Storage and profile recovery
 
 Profiles live in `$XDG_CONFIG_HOME/display-workspaces/profiles.json`, defaulting to `~/.config/display-workspaces/profiles.json`. The versioned file contains monitor serials and workspace IDs; treat it and its backups as private configuration, not shareable examples.
 
-Changes to an existing store first back up its exact bytes beside it as `profiles.json.profile-<random-token>.bak`, then atomically replace the store. Feedback reports backup paths. Ownership, permissions, symlinks, schema version, and revision are checked; malformed or newer-version files are refused rather than overwritten. Profile operations use a separate store lock across compositor sessions. Do not manually edit the store while an operation is running: guards detect observed external edits, but arbitrary editors do not participate in the lock.
+Changes to an existing store first back up its exact bytes beside it as `profiles.json.profile-<random-token>.bak`, then atomically replace the store. **Profiles → Details** reports the last profile operation's backup paths. Ownership, permissions, symlinks, schema version, and revision are checked; malformed or newer-version files are refused rather than overwritten. Profile operations use a separate store lock across compositor sessions. Do not manually edit the store while an operation is running: guards detect observed external edits, but arbitrary editors do not participate in the lock. Automatic authorization is rechecked before mutation and before unattended keep.
 
 For manual recovery, close the panel, preserve the current file, and compare a backup before restoring or merging it. Restoring the whole file can erase profiles saved later. Reopen the panel or use Detect displays afterward. No Hyprland reload is needed. Profile backups are not automatically pruned. Forget and uninstall do not remove profiles or their backups.
+
+Version 2.4 reads version-1 profile stores without writing them and treats every old profile as manual. The next confirmed store change writes schema version 2 with explicit automation flags, preserving the old file in an exact backup. Plugin versions through 2.3 cannot read schema 2. Before downgrading, preserve the current store and review an appropriate old-format backup; restoring it can lose profiles or changes made later.
 
 ## Forget display
 

@@ -18,6 +18,7 @@ import time
 
 import configuration as display_config
 import profiles as display_profiles
+import automation as display_automation
 
 CONFIRM_SECONDS = 20
 COORD_LIMIT = 32768
@@ -597,7 +598,8 @@ def save(root, state):
 def response(state):
     remaining = max(0, math.ceil(state.get("deadline", 0) - time.monotonic())) if state["state"] == "pending" else 0
     return {"ok": state["state"] != "failed", "token": state["token"], "state": state["state"],
-            "secondsRemaining": remaining, "message": state["message"]}
+            "secondsRemaining": remaining, "message": state["message"],
+            "automatic": state.get("automatic", False), "profileName": state.get("profileName", "")}
 
 
 def expire_unstarted(root, state):
@@ -625,49 +627,53 @@ def resume():
 def begin(request):
     root = runtime_dir()
     with locked(root):
-        require_no_forget(root)
-        active = root / "active.json"
-        if active.exists():
-            previous = load(root, json.loads(active.read_text())["token"])
-            expire_unstarted(root, previous)
-            if previous["state"] not in TERMINAL:
-                raise ValueError("Another arrangement trial is active. Keep it or wait for rollback.")
-        current = snapshot()
-        plan = validate(request, current)
-        if plan["displayChanges"]:
-            require_exact_rules(m["name"] for m in current["monitors"])
-        if not plan["displayChanges"] and not plan["workspaceChanges"]:
-            raise ValueError("There are no arrangement changes to try.")
-        if not shutil.which("systemd-run") or not shutil.which("hyprctl"):
-            raise ValueError("systemd-run and hyprctl are required for safe rollback.")
-        token = secrets.token_hex(24)
-        ui_screen = request.get("uiScreen")
-        if not isinstance(ui_screen, str) or ui_screen not in {m["name"] for m in current["monitors"]}:
-            ui_screen = next((m["name"] for m in current["monitors"] if m.get("focused")), current["monitors"][0]["name"])
-        state = {"token": token, "state": "starting", "message": "Starting 20-second preview…",
-                 "baseline": current, "plan": plan, "request": "", "phase": "prepared",
-                 "created": time.monotonic(), "deadline": 0, "mutationStarted": False, "uiScreen": ui_screen}
-        if plan["profileWorkspaces"] is not None:
-            state["profileJournal"] = prepare_profile(state, workspace_rules())
+        display_automation.suppress(sys.modules[__name__], root)
+        return begin_locked(root, request)
+
+
+def begin_locked(root, request, *, automatic_profile=None):
+    """Caller owns runtime lock; unattended authorization is never read from user JSON."""
+    require_no_forget(root)
+    require_no_preview(root)
+    current = snapshot()
+    plan = validate(request, current)
+    if plan["displayChanges"]:
+        require_exact_rules(m["name"] for m in current["monitors"])
+    if not plan["displayChanges"] and not plan["workspaceChanges"]:
+        raise ValueError("There are no arrangement changes to try.")
+    if not shutil.which("systemd-run") or not shutil.which("hyprctl"):
+        raise ValueError("systemd-run and hyprctl are required for safe rollback.")
+    token = secrets.token_hex(24)
+    ui_screen = request.get("uiScreen")
+    if not isinstance(ui_screen, str) or ui_screen not in {m["name"] for m in current["monitors"]}:
+        ui_screen = next((m["name"] for m in current["monitors"] if m.get("focused")), current["monitors"][0]["name"])
+    state = {"token": token, "state": "starting", "message": "Starting 20-second preview…",
+             "baseline": current, "plan": plan, "request": "", "phase": "prepared",
+             "created": time.monotonic(), "deadline": 0, "mutationStarted": False, "uiScreen": ui_screen,
+             "automatic": automatic_profile is not None}
+    if automatic_profile is not None:
+        state.update(automaticProfile=automatic_profile, profileName=automatic_profile["name"],
+                     message=f"Starting guarded automatic restoration of {automatic_profile['name']}…")
+    if plan["profileWorkspaces"] is not None:
+        state["profileJournal"] = prepare_profile(state, workspace_rules())
+    save(root, state)
+    atomic(root, "active.json", {"token": token})
+    args = ["systemd-run", "--user", "--quiet", "--collect", "--service-type=exec",
+            f"--unit=display-workspaces-arrange-{token}", "--property=Restart=on-failure",
+            "--property=RestartSec=1", "--property=StartLimitIntervalSec=0",
+            "--property=TimeoutStopSec=25", "--property=UMask=0077"]
+    for name in ("HOME", "XDG_CONFIG_HOME", "HYPRLAND_INSTANCE_SIGNATURE", "XDG_RUNTIME_DIR",
+                 "WAYLAND_DISPLAY", "PATH", "DBUS_SESSION_BUS_ADDRESS"):
+        if name in os.environ:
+            args.append(f"--setenv={name}={os.environ[name]}")
+    args.extend([sys.executable, str(Path(__file__).resolve()), "worker", token])
+    try:
+        run(args, timeout=10)
+    except Exception as error:
+        # A late worker cannot mutate until this lock is released, then sees failure.
+        state.update(state="failed", message=f"Watchdog could not start; nothing changed. {error}")
         save(root, state)
-        atomic(root, "active.json", {"token": token})
-        args = ["systemd-run", "--user", "--quiet", "--collect", "--service-type=exec",
-                f"--unit=display-workspaces-arrange-{token}", "--property=Restart=on-failure",
-                "--property=RestartSec=1", "--property=StartLimitIntervalSec=0",
-                "--property=TimeoutStopSec=25", "--property=UMask=0077"]
-        for name in ("HOME", "XDG_CONFIG_HOME", "HYPRLAND_INSTANCE_SIGNATURE", "XDG_RUNTIME_DIR",
-                     "WAYLAND_DISPLAY", "PATH", "DBUS_SESSION_BUS_ADDRESS"):
-            if name in os.environ:
-                args.append(f"--setenv={name}={os.environ[name]}")
-        args.extend([sys.executable, str(Path(__file__).resolve()), "worker", token])
-        try:
-            run(args, timeout=10)
-        except Exception as error:
-            # Even if systemd accepted the unit before the launcher timed out, the worker
-            # cannot mutate while this lock is held and will see this terminal state.
-            state.update(state="failed", message=f"Watchdog could not start; nothing changed. {error}")
-            save(root, state)
-        return response(state)
+    return response(state)
 
 
 def control(command, token):
@@ -676,6 +682,9 @@ def control(command, token):
         state = load(root, token)
         expire_unstarted(root, state)
         if state["state"] not in TERMINAL and command in ("keep", "revert"):
+            if command == "keep" and state.get("automatic", False):
+                return {**response(state), "ok": False,
+                        "message": "Automatic restoration must complete its full 20-second observation. Revert remains available."}
             if command == "keep" and state["state"] != "pending":
                 return {**response(state), "ok": False, "message": "Wait until the trial is ready before keeping it."}
             if command == "keep":
@@ -972,6 +981,19 @@ def rollback(state):
     return list(dict.fromkeys(errors))
 
 
+def announce_automatic(state):
+    if not state.get("automatic", False):
+        return
+    # The worker journal and panel remain authoritative if desktop notifications fail.
+    try:
+        print(f"Automatic profile {state.get('profileName', '')}: {state['message']}", flush=True)
+        run(["notify-send", "--app-name=Display Workspaces",
+             "--urgency=critical" if state["state"] == "failed" else "--urgency=normal",
+             "Automatic display restoration", state["message"]], timeout=1)
+    except (OSError, subprocess.SubprocessError, ValueError):
+        pass
+
+
 def worker(root, token):
     with locked(root, "worker.lock"):
         with locked(root):
@@ -985,31 +1007,42 @@ def worker(root, token):
         failed = recover
         try:
             if not recover:
-                # Fresh authoritative preflight in the independent worker; no panel
-                # process can perform mutations before the rollback owner exists.
-                request = {"baseline": state["baseline"], "positions": state["plan"]["positions"],
-                           "workspaces": state["plan"]["workspaces"],
-                           "profileWorkspaces": state["plan"].get("profileWorkspaces")}
-                fresh = validate(request)
-                if fresh["profileWorkspaces"] is not None:
-                    if not set(fresh["removeWorkspaces"]) <= set(state["plan"]["removeWorkspaces"]):
-                        raise ValueError("The empty workspace set changed; refresh the profile draft.")
-                    if workspace_rules() != state["profileJournal"]["beforeRules"]:
-                        raise ValueError("Workspace rules changed before preview.")
+                # Hold the runtime lock throughout preflight and first mutation:
+                # an expired launcher or profile edit cannot steal phase ownership.
                 with locked(root):
                     state = load(root, token)
                     if state.get("request") == "revert":
-                        state.update(state="reverted", message="Trial cancelled; nothing changed.")
+                        state.update(state="reverted", phase="finished", message="Trial cancelled; nothing changed.")
                         save(root, state)
                         return
-                    state["mutationStarted"] = True
-                    save(root, state)
-                if state["plan"]["displayChanges"]:
-                    # Pin every output together: leaving an unchanged output on its
-                    # existing 'auto' rule can move it when another output moves.
-                    set_positions(state["baseline"], state["plan"]["positions"], force=True)
-                if state["plan"].get("profileWorkspaces") is not None:
-                    apply_profile(state)
+                    request = {"baseline": state["baseline"], "positions": state["plan"]["positions"],
+                               "workspaces": state["plan"]["workspaces"],
+                               "profileWorkspaces": state["plan"].get("profileWorkspaces")}
+                    authorization = (display_automation.worker_request(sys.modules[__name__], state)
+                                     if state.get("automatic", False) else contextlib.nullcontext(request))
+                    with authorization as request:
+                        fresh = validate(request)
+                        if fresh["profileWorkspaces"] is not None:
+                            if not set(fresh["removeWorkspaces"]) <= set(state["plan"]["removeWorkspaces"]):
+                                raise ValueError("The empty workspace set changed; refresh the profile draft.")
+                            if workspace_rules() != state["profileJournal"]["beforeRules"]:
+                                raise ValueError("Workspace rules changed before preview.")
+                        if state.get("automatic", False):
+                            # Pair the saved selection with its fresh pre-mutation
+                            # baseline, including workspace moves made during launch.
+                            state["baseline"] = request["baseline"]
+                            state["plan"] = fresh
+                            state["profileJournal"] = prepare_profile(state, workspace_rules())
+                            data = display_profiles.read_store(display_profiles.store_path())
+                            if display_config.digest(data) != state["automaticProfile"]["revision"]:
+                                raise ValueError("Saved profiles changed before automatic restoration.")
+                        state["mutationStarted"] = True
+                        save(root, state)
+                        if state["plan"]["displayChanges"]:
+                            # Pin unchanged outputs too: 'auto' rules may otherwise move them.
+                            set_positions(state["baseline"], state["plan"]["positions"], force=True)
+                        if state["plan"].get("profileWorkspaces") is not None:
+                            apply_profile(state)
                 if state["plan"]["displayChanges"] or state["plan"].get("profileWorkspaces") is not None:
                     # Installing monitor rules can reapply persistent workspace
                     # bindings. Reconcile the complete intended allocation after
@@ -1031,25 +1064,39 @@ def worker(root, token):
                     latest = load(root, token)
                     state.update(request=latest.get("request", ""), state="pending", phase="waiting",
                                  deadline=time.monotonic() + CONFIRM_SECONDS,
-                                 message="Preview only. Click Apply within 20 seconds to keep this arrangement.")
+                                 message=(f"Restoring {state['profileName']} automatically. Verifying for 20 seconds, then keeping for this session. Open the arrangement panel to Revert."
+                                          if state.get("automatic", False)
+                                          else "Preview only. Click Apply within 20 seconds to keep this arrangement."))
                     save(root, state)
+                announce_automatic(state)
                 while True:
                     with locked(root):
                         state = load(root, token)
                         if state.get("request") == "revert":
                             reason = "Previous arrangement restored."
                             break
-                        if time.monotonic() >= state["deadline"]:
+                        expired = time.monotonic() >= state["deadline"]
+                        automatic = state.get("automatic", False)
+                        if expired and not automatic:
                             reason = "Preview expired without Apply; previous arrangement restored."
                             break
-                        if state.get("request") == "keep":
-                            verify_trial(state)
-                            if time.monotonic() >= state["deadline"]:
-                                reason = "Preview expired without Apply; previous arrangement restored."
-                                break
-                            state.update(state="kept", phase="finished", message="Arrangement applied for this session only.")
-                            save(root, state)
-                            return
+                        if (automatic and expired) or (not automatic and state.get("request") == "keep"):
+                            authorization = (display_automation.profile_guard(state) if automatic
+                                             else contextlib.nullcontext(None))
+                            with authorization as guard:
+                                verify_trial(state)
+                                if automatic:
+                                    path, original = guard
+                                    if display_profiles.read_store(path) != original:
+                                        raise ValueError("Saved profiles changed before automatic confirmation.")
+                                elif time.monotonic() >= state["deadline"]:
+                                    reason = "Preview expired without Apply; previous arrangement restored."
+                                    break
+                                state.update(state="kept", phase="finished",
+                                             message=(f"Automatic profile {state['profileName']} kept after 20 seconds of verification; session only."
+                                                      if automatic else "Arrangement applied for this session only."))
+                                save(root, state)
+                                return
                     # Detect unplug/external changes during the countdown, not just on Keep.
                     verify_trial(state)
                     time.sleep(0.2)
@@ -1098,6 +1145,7 @@ def require_no_forget(root):
 def forget(request):
     root = runtime_dir()
     with locked(root):
+        display_automation.suppress(sys.modules[__name__], root)
         require_no_preview(root)
         require_no_forget(root)
         # Preflight supplies immediate stale-selection feedback; worker repeats it.
@@ -1169,14 +1217,15 @@ def main():
         return display_config.configuration(sys.modules[__name__])
     if command == "profiles" and len(sys.argv) == 2:
         return display_profiles.catalog(sys.modules[__name__])
-    if command in ("profile-save", "profile-delete", "profile-load") and len(sys.argv) == 3:
+    if command in ("profile-save", "profile-delete", "profile-load", "profile-auto") and len(sys.argv) == 3:
         if len(sys.argv[2]) > 1048576:
             raise ValueError("Profile request is too large.")
         request = json.loads(sys.argv[2], object_pairs_hook=display_config.strict_object)
         operation = {"profile-save": display_profiles.save, "profile-delete": display_profiles.delete,
-                     "profile-load": display_profiles.load}[command]
+                     "profile-load": display_profiles.load, "profile-auto": display_profiles.set_automatic}[command]
         root = runtime_dir()
         with locked(root):
+            display_automation.suppress(sys.modules[__name__], root)
             require_no_preview(root)
             require_no_forget(root)
             return operation(sys.modules[__name__], request)
@@ -1191,6 +1240,11 @@ def main():
         return {"ok": True, "message": "Forget worker finished."}
     if command == "resume" and len(sys.argv) == 2:
         return resume()
+    if command == "auto-check" and len(sys.argv) == 3:
+        if len(sys.argv[2]) > 4096:
+            raise ValueError("Automatic check request is too large.")
+        return display_automation.check(sys.modules[__name__],
+                                        json.loads(sys.argv[2], object_pairs_hook=display_config.strict_object))
     if command in ("validate", "begin") and len(sys.argv) == 3:
         if len(sys.argv[2]) > 1048576:
             raise ValueError("Arrangement request is too large.")
@@ -1201,8 +1255,11 @@ def main():
     if command == "worker" and len(sys.argv) == 3:
         signal.signal(signal.SIGTERM, interrupted)
         signal.signal(signal.SIGINT, interrupted)
-        worker(runtime_dir(), sys.argv[2])
-        return {"ok": True, "message": "Watchdog finished."}
+        root = runtime_dir()
+        worker(root, sys.argv[2])
+        finished = load(root, sys.argv[2])
+        announce_automatic(finished)
+        return {"ok": True, "message": "Watchdog finished.", "result": response(finished)}
     raise ValueError("Invalid arrangement command or arguments.")
 
 
