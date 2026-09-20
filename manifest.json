@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "display.workspaces",
   "name": "Omarchy Display Workspaces",
-  "version": "2.2.1",
+  "version": "2.3.0",
   "author": "nephilus (based on Omarchy)",
   "description": "Display workspace groups, manual profiles, and session-only layout previews",
   "kinds": [

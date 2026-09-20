@@ -298,11 +298,249 @@ def validate(request, current=None):
         if source == target:
             raise ValueError("Include only changed workspace placements.")
         moves.append({"id": wid, "source": source, "target": target})
+    profile = request.get("profileWorkspaces")
+    removals = []
+    if profile is not None:
+        saved = indexed(profile, "id", "profile workspace")
+        if not saved:
+            raise ValueError("Provide the complete nonempty saved workspace list.")
+        profile = []
+        for wid, placement in saved.items():
+            numeric(wid, "profile workspace ID", 1, 2147483647, True)
+            target = placement.get("target")
+            if not isinstance(target, str) or target not in monitors:
+                raise ValueError("A saved workspace refers to a missing display.")
+            old, live = old_ws.get(wid), live_ws.get(wid)
+            if (old is None) != (live is None) or old and old["monitor"] != live["monitor"]:
+                raise ValueError(f"Saved workspace {wid} changed. Refresh the panel.")
+            if wid in changes and changes[wid]["target"] != target:
+                raise ValueError(f"Workspace {wid} has conflicting draft targets.")
+            profile.append({"id": wid, "target": target})
+        for wid, old in old_ws.items():
+            if wid <= 0 or wid in saved:
+                continue
+            live = live_ws.get(wid)
+            if live is not None and live["monitor"] != old["monitor"]:
+                raise ValueError(f"Extra workspace {wid} moved externally. Refresh the panel.")
+            if live is None and not workspace_may_expire(baseline, wid):
+                raise ValueError(f"Extra workspace {wid} disappeared. Refresh the panel.")
+        removals = sorted(wid for wid, workspace in live_ws.items()
+                          if wid > 0 and wid not in saved
+                          and type(workspace.get("windows")) is int and workspace["windows"] == 0)
+        if any(move["id"] in removals for move in moves):
+            raise ValueError("An empty extra workspace cannot be moved and retired together.")
+        retained = {w["id"]: w["monitor"] for w in live_ws.values() if w["id"] > 0 and w["id"] not in removals}
+        retained.update({move["id"]: move["target"] for move in moves})
+        retained.update({placement["id"]: placement["target"] for placement in profile})
+        if set(retained.values()) != set(monitors):
+            raise ValueError("Keep at least one saved or populated workspace on every enabled display.")
     count = sum(not same_fields(p, monitors[p["name"]], POSITION) for p in normalized)
     if count and live_validation:
         require_exact_rules(monitors)
-    return {"ok": True, "positions": normalized, "workspaces": moves, "displayChanges": count,
-            "workspaceChanges": len(moves), "message": f"{count} display change(s), {len(moves)} workspace move(s)."}
+    workspace_count = len({move["id"] for move in moves}
+                          | {placement["id"] for placement in profile or []} | set(removals))
+    return {"ok": True, "positions": normalized, "workspaces": moves, "profileWorkspaces": profile,
+            "removeWorkspaces": removals, "displayChanges": count, "workspaceChanges": workspace_count,
+            "message": (f"{count} display change(s), {workspace_count} workspace change(s)."
+                        + (f" Restore/retain {len(profile)} saved workspace(s); retire {len(removals)} empty extra(s)."
+                           if profile is not None else ""))}
+
+
+def workspace_rules():
+    rules = query("workspacerules")
+    if not isinstance(rules, list) or any(
+            not isinstance(rule, dict) or not isinstance(rule.get("workspaceString"), str)
+            or type(rule.get("enabled")) is not bool
+            or "persistent" in rule and type(rule["persistent"]) is not bool for rule in rules):
+        raise ValueError("Cannot inspect live workspace rules safely.")
+    enabled = [rule["workspaceString"] for rule in rules if rule["enabled"]]
+    if len(enabled) != len(set(enabled)):
+        raise ValueError("Duplicate enabled workspace selectors prevent safe profile restoration.")
+    return rules
+
+
+def exact_workspace_id(selector):
+    # Hyprland 0.56.2 parses numeric selectors with decimal stoi, while
+    # replaceOrAdd compares the original selector string, not the numeric ID.
+    if re.fullmatch(r"0*[1-9][0-9]*", selector) and len(selector.lstrip("0")) <= 10:
+        wid = int(selector)
+        if wid <= 2147483647:
+            return wid
+    return None
+
+
+def prepare_profile(state, rules):
+    plan = state["plan"]
+    affected = {w["id"] for w in plan["profileWorkspaces"]} | set(plan["removeWorkspaces"])
+    persistent = []
+    for rule in rules:
+        if not rule["enabled"] or not rule.get("persistent"):
+            continue
+        wid = exact_workspace_id(rule["workspaceString"])
+        if wid is None and not rule["workspaceString"].startswith("special"):
+            raise ValueError("A broad or named persistent workspace rule prevents safe profile restoration.")
+        if wid in affected:
+            persistent.append(rule)
+    occupied = {rule["workspaceString"] for rule in rules}
+    pins, restore_pins = [], []
+    originals = indexed(state["baseline"]["workspaces"], "id", "workspace")
+    restoration = [{"id": wid, "target": originals[wid]["monitor"]} for wid in plan["removeWorkspaces"]]
+    for workspace in plan["profileWorkspaces"] + restoration:
+        selector = "0" + str(workspace["id"])
+        while selector in occupied:
+            selector = "0" + selector
+        occupied.add(selector)
+        entry = {**workspace, "selector": selector}
+        (pins if workspace in plan["profileWorkspaces"] else restore_pins).append(entry)
+    return {"beforeRules": rules, "persistent": persistent, "pins": pins, "restorePins": restore_pins}
+
+
+def profile_key(state):
+    return lua_string("_display_workspaces_" + state["token"])
+
+
+def profile_status(state):
+    # The compositor journal survives Python worker death. Handles expire on
+    # configuration reload, so a replacement worker must not reacquire rules by
+    # selector and accidentally take ownership of a user's new declarations.
+    code = (f"local j=rawget(_G,{profile_key(state)}); "
+            "if not j then return 'missing' end; "
+            "for _,r in pairs(j.pins) do if r:is_enabled()~=true then return 'changed' end end; "
+            "for _,r in pairs(j.rules) do if r:is_enabled()~=true then return 'changed' end end; "
+            "local ids={}; for id in pairs(j.cleaned) do ids[#ids+1]=id end; "
+            "table.sort(ids); return 'ids:'..table.concat(ids,',')")
+    result = run(["hyprctl", "repl", code])
+    if result in ("missing", "changed"):
+        raise ValueError("Profile workspace rules were reloaded or changed externally.")
+    if not result.startswith("ids:"):
+        raise ValueError("Cannot inspect the compositor's profile journal.")
+    try:
+        return {int(wid) for wid in result[4:].split(",") if wid}
+    except ValueError as error:
+        raise ValueError("Cannot inspect the compositor's profile journal.") from error
+
+
+def expected_profile_rules(state, cleaned):
+    journal = state["profileJournal"]
+    saved = {pin["id"] for pin in journal["pins"]}
+    changed = {rule["workspaceString"] for rule in journal["persistent"]
+               if exact_workspace_id(rule["workspaceString"]) in saved | set(cleaned)}
+    rules = [dict(rule, persistent=False) if rule["enabled"] and rule["workspaceString"] in changed else rule
+             for rule in journal["beforeRules"]]
+    return rules + [{"workspaceString": pin["selector"], "enabled": True, "persistent": True,
+                     "monitor": pin["target"]} for pin in journal["pins"]]
+
+
+def require_profile_rules(state, cleaned):
+    if workspace_rules() != expected_profile_rules(state, cleaned):
+        raise ValueError("Workspace rules changed externally; refusing a stale profile transaction.")
+
+
+def apply_profile(state):
+    journal, baseline = state["profileJournal"], state["baseline"]
+    if workspace_rules() != journal["beforeRules"]:
+        raise ValueError("Workspace rules changed before profile restoration.")
+    current = snapshot()
+    compare_outputs(expected_outputs(baseline, state["plan"]["positions"]), current)
+    saved = {pin["id"] for pin in journal["pins"]}
+    code = ''.join("do " + monitor_guard(monitor) + "end; " for monitor in current["monitors"])
+    for workspace in current["workspaces"]:
+        if workspace["id"] <= 0:
+            continue
+        code += (f"do local w=hl.get_workspace({workspace['id']}); "
+                 f"assert(w and w.monitor and w.monitor.name=={lua_string(workspace['monitor'])}, "
+                 "'Workspace changed before profile mutation'); end; ")
+    present = {workspace["id"] for workspace in current["workspaces"]}
+    for wid in saved - present:
+        code += f"assert(not hl.get_workspace({wid}), 'Saved workspace appeared before profile mutation'); "
+    code += (f"assert(rawget(_G,{profile_key(state)})==nil, 'Profile journal already exists'); "
+             f"local j={{pins={{}},rules={{}},cleaned={{}},temporary={{}}}}; _G[{profile_key(state)}]=j; ")
+    for rule in journal["persistent"]:
+        if exact_workspace_id(rule["workspaceString"]) not in saved:
+            continue
+        selector = lua_string(rule["workspaceString"])
+        code += (f"j.rules[{selector}]=hl.workspace_rule({{workspace={selector}}}); "
+                 f"hl.workspace_rule({{workspace={selector},persistent=false}}); ")
+    for pin in journal["pins"]:
+        selector = lua_string(pin["selector"])
+        code += (f"j.pins[{selector}]=hl.workspace_rule({{workspace={selector},"
+                 f"monitor={lua_string(pin['target'])},persistent=true}}); ")
+    code += "hl.exec_scheduled_prop_refresh_immediately();"
+    lua_eval(code)
+
+
+def cleanup_profile(state, root=None):
+    cleaned = profile_status(state)
+    require_profile_rules(state, cleaned)
+    current = snapshot()
+    compare_outputs(expected_outputs(state["baseline"], state["plan"]["positions"]), current)
+    plan = state["plan"]
+    # Workspace moves can create empty replacements after the initial plan.
+    # Journal these backend-derived candidates before touching them as well.
+    originals = indexed(state["baseline"]["workspaces"], "id", "workspace")
+    saved = {placement["id"] for placement in plan["profileWorkspaces"]}
+    replacements = [w for w in current["workspaces"] if w["id"] > 0 and w["id"] not in originals
+                    and w["id"] not in saved and type(w.get("windows")) is int and w["windows"] == 0]
+    sources = {str(wid): originals[wid]["monitor"] for wid in plan["removeWorkspaces"] if wid in originals}
+    sources.update(state["profileJournal"].get("cleanupSources", {}))
+    sources.update({str(w["id"]): w["monitor"] for w in replacements})
+    plan["removeWorkspaces"] = sorted(set(plan["removeWorkspaces"]) | {w["id"] for w in replacements})
+    state["profileJournal"]["cleanupSources"] = sources
+    if root is not None:
+        with locked(root):
+            latest = load(root, state["token"])
+            state["request"] = latest.get("request", "")
+            save(root, state)
+    retired = set(plan["removeWorkspaces"])
+    retained = {w["id"]: w["monitor"] for w in current["workspaces"] if w["id"] > 0 and w["id"] not in retired}
+    code = ''.join("do " + monitor_guard(monitor) + "end; " for monitor in current["monitors"])
+    code += f"local j=rawget(_G,{profile_key(state)}); assert(j, 'Profile journal lost'); "
+    for wid in plan["removeWorkspaces"]:
+        source = sources[str(wid)]
+        replacement = next((rid for rid, target in retained.items() if target == source), None)
+        if replacement is None:
+            raise ValueError(f"No retained workspace can replace empty workspace {wid} on {source}.")
+        code += (f"do local w=hl.get_workspace({wid}); "
+                 # Both conditions are live compositor facts, evaluated in the
+                 # same event-loop callback as persistence and visibility changes.
+                 f"if not w or (w.windows==0 and w.is_empty and w.monitor "
+                 f"and w.monitor.name=={lua_string(source)}) then "
+                 f"j.cleaned[{wid}]=true; ")
+        for rule in state["profileJournal"]["persistent"]:
+            if exact_workspace_id(rule["workspaceString"]) != wid:
+                continue
+            selector = lua_string(rule["workspaceString"])
+            code += (f"j.rules[{selector}]=hl.workspace_rule({{workspace={selector}}}); "
+                     f"hl.workspace_rule({{workspace={selector},persistent=false}}); ")
+        code += (f"if w and w.visible then local r=hl.get_workspace({replacement}); "
+                 "assert(r and r.monitor==w.monitor, 'Cleanup replacement changed'); "
+                 "w.monitor:set_workspace({workspace=r.name}) end; end; end; ")
+    code += "hl.exec_scheduled_prop_refresh_immediately();"
+    lua_eval(code)
+
+
+def verify_trial(state):
+    plan = state["plan"]
+    cleaned = set()
+    if plan.get("profileWorkspaces") is not None:
+        cleaned = profile_status(state)
+        if not cleaned <= set(plan["removeWorkspaces"]):
+            raise ValueError("The profile cleanup journal is inconsistent.")
+        require_profile_rules(state, cleaned)
+    verify_arrangement(state["baseline"], plan["positions"], plan["workspaces"],
+                       plan.get("profileWorkspaces"), cleaned)
+
+
+def settle_trial(state):
+    deadline = time.monotonic() + 3
+    while True:
+        try:
+            verify_trial(state)
+            return
+        except ValueError:
+            if time.monotonic() >= deadline:
+                raise
+            time.sleep(0.1)
 
 
 def runtime_dir():
@@ -409,6 +647,8 @@ def begin(request):
         state = {"token": token, "state": "starting", "message": "Starting 20-second preview…",
                  "baseline": current, "plan": plan, "request": "", "phase": "prepared",
                  "created": time.monotonic(), "deadline": 0, "mutationStarted": False, "uiScreen": ui_screen}
+        if plan["profileWorkspaces"] is not None:
+            state["profileJournal"] = prepare_profile(state, workspace_rules())
         save(root, state)
         atomic(root, "active.json", {"token": token})
         args = ["systemd-run", "--user", "--quiet", "--collect", "--service-type=exec",
@@ -439,7 +679,7 @@ def control(command, token):
             if command == "keep" and state["state"] != "pending":
                 return {**response(state), "ok": False, "message": "Wait until the trial is ready before keeping it."}
             if command == "keep":
-                verify_arrangement(state["baseline"], state["plan"]["positions"], state["plan"]["workspaces"])
+                verify_trial(state)
             # A rollback request is irreversible, including racing keep/revert callers.
             if state.get("request") != "revert":
                 state["request"] = command
@@ -539,7 +779,7 @@ def restore_view(baseline, recovery=False):
         name = lua_string(monitor["name"])
         code.append(f"do local m=hl.get_monitor({name}); local w=hl.get_workspace({wid}); "
                     f"if m and m.id=={monitor['id']} and m.serial=={lua_string(monitor.get('serial', ''))} "
-                    f"and w and w.monitor==m then m:set_workspace({{workspace={wid}}}) end end;")
+                    "and w and w.monitor==m then m:set_workspace({workspace=w.name}) end end;")
     focused = next((m for m in baseline["monitors"] if m.get("focused")), None)
     if focused:
         name = lua_string(focused["name"])
@@ -553,17 +793,27 @@ def restore_view(baseline, recovery=False):
         lua_eval(''.join(code))
 
 
-def verify_arrangement(baseline, positions, moves):
+def verify_arrangement(baseline, positions, moves, profile=None, cleaned=()):
     current = snapshot()
     compare_outputs(expected_outputs(baseline, positions), current)
     workspaces = indexed(current["workspaces"], "id", "workspace")
     expected = {w["id"]: w["monitor"] for w in baseline["workspaces"] if w["id"] > 0}
     expected.update({move["id"]: move["target"] for move in moves})
+    saved = {placement["id"]: placement["target"] for placement in profile or []}
+    expected.update(saved)
+    for wid in cleaned:
+        workspace = workspaces.get(wid)
+        if workspace is None:
+            expected.pop(wid, None)
+        elif type(workspace.get("windows")) is int and workspace["windows"] == 0:
+            raise ValueError(f"Empty extra workspace {wid} did not retire.")
     for wid, target in expected.items():
-        if wid not in workspaces and workspace_may_expire(baseline, wid):
+        if wid not in saved and wid not in workspaces and workspace_may_expire(baseline, wid):
             continue
         if workspaces.get(wid, {}).get("monitor") != target:
             raise ValueError(f"Workspace {wid} did not retain its intended display {target}.")
+        if wid in saved and workspaces[wid].get("ispersistent") is not True:
+            raise ValueError(f"Saved workspace {wid} was not retained for the session.")
 
 
 def settle(baseline, positions, moves):
@@ -576,6 +826,86 @@ def settle(baseline, positions, moves):
             if time.monotonic() >= deadline:
                 raise
             time.sleep(0.1)
+
+
+def rollback_profile(state):
+    journal = state["profileJournal"]
+    current, rules = snapshot(), workspace_rules()
+    live = indexed(current["monitors"], "name", "display")
+    workspaces = indexed(current["workspaces"], "id", "workspace")
+    original = indexed(state["baseline"]["workspaces"], "id", "workspace")
+    targets = {pin["id"]: pin["target"] for pin in journal["pins"]}
+    targets.update({move["id"]: move["target"] for move in state["plan"]["workspaces"]})
+    errors, code = [], f"local j=rawget(_G,{profile_key(state)}); "
+    for pin in journal["pins"]:
+        expected = {"workspaceString": pin["selector"], "enabled": True, "persistent": True, "monitor": pin["target"]}
+        actual = next((rule for rule in rules if rule["workspaceString"] == pin["selector"] and rule["enabled"]), None)
+        if actual is None:
+            continue
+        if actual != expected:
+            errors.append(f"Workspace {pin['id']} session rule changed externally; preserving it.")
+            continue
+        selector = lua_string(pin["selector"])
+        code += (f"assert(j and j.pins[{selector}] and j.pins[{selector}]:is_enabled()~=nil, "
+                 "'Profile rule handle expired; preserving reloaded rules'); "
+                 f"j.pins[{selector}]:set_enabled(false); ")
+    for rule in journal["persistent"]:
+        actual = next((r for r in rules if r["workspaceString"] == rule["workspaceString"] and r["enabled"]), None)
+        if actual == rule:
+            continue
+        if actual != dict(rule, persistent=False):
+            errors.append(f"Workspace rule {rule['workspaceString']} changed externally; preserving it.")
+            continue
+        wid = exact_workspace_id(rule["workspaceString"])
+        workspace = workspaces.get(wid)
+        allowed = {targets.get(wid), original.get(wid, {}).get("monitor")}
+        if workspace and workspace["monitor"] not in allowed:
+            errors.append(f"Workspace {wid} moved externally; preserving its placement and rule.")
+            continue
+        selector = lua_string(rule["workspaceString"])
+        code += (f"assert(j and j.rules[{selector}] and j.rules[{selector}]:is_enabled()==true, "
+                 "'Original workspace rule handle expired; preserving reloaded rules'); "
+                 f"hl.workspace_rule({{workspace={selector},persistent=true}}); ")
+    # Recreate retired original empties only while the compositor still owns the
+    # cleanup journal. A temporary pin keeps each alive until focus is restored.
+    for pin in journal["restorePins"]:
+        if pin["id"] in workspaces:
+            continue
+        monitor = live.get(pin["target"])
+        before = next(m for m in state["baseline"]["monitors"] if m["name"] == pin["target"])
+        if monitor is None or not same_identity(before, monitor):
+            errors.append(f"Workspace {pin['id']}: original display is unavailable.")
+            continue
+        selector = lua_string(pin["selector"])
+        existing = next((rule for rule in rules if rule["workspaceString"] == pin["selector"] and rule["enabled"]), None)
+        expected = {"workspaceString": pin["selector"], "enabled": True, "persistent": True, "monitor": pin["target"]}
+        if existing is not None and existing != expected:
+            errors.append(f"Workspace {pin['id']} restoration rule changed externally; preserving it.")
+            continue
+        code += (f"if j and j.cleaned[{pin['id']}] then do {monitor_guard(monitor)}"
+                 f"if not hl.get_workspace({pin['id']}) then "
+                 f"if j.temporary[{selector}] then "
+                 f"assert(j.temporary[{selector}]:is_enabled()~=nil, 'Restoration rule expired'); "
+                 f"j.temporary[{selector}]:set_enabled(true) else "
+                 f"j.temporary[{selector}]=hl.workspace_rule({{workspace={selector},"
+                 f"monitor={lua_string(pin['target'])},persistent=true}}) end end end end; ")
+    code += "hl.exec_scheduled_prop_refresh_immediately();"
+    lua_eval(code)
+    return errors
+
+
+def finish_profile_rollback(state):
+    rules = workspace_rules()
+    code = f"local j=rawget(_G,{profile_key(state)}); "
+    for pin in state["profileJournal"]["restorePins"]:
+        expected = {"workspaceString": pin["selector"], "enabled": True, "persistent": True, "monitor": pin["target"]}
+        if expected not in rules:
+            continue
+        selector = lua_string(pin["selector"])
+        code += (f"if j and j.temporary[{selector}] and j.temporary[{selector}]:is_enabled()~=nil "
+                 f"then j.temporary[{selector}]:set_enabled(false) end; ")
+    code += "hl.exec_scheduled_prop_refresh_immediately();"
+    lua_eval(code)
 
 
 def rollback(state):
@@ -604,12 +934,23 @@ def rollback(state):
             set_positions(current, positions, force=True, recovery=True)
     except Exception as error:
         errors.append(str(error))
+    if state.get("profileJournal"):
+        try:
+            errors.extend(rollback_profile(state))
+        except Exception as error:
+            errors.append(str(error))
     # Moving an active workspace may also move/create a replacement. Restore all
     # original surviving workspaces, not only the ones explicitly requested.
     for workspace in baseline["workspaces"]:
         if workspace["id"] <= 0 or workspace["monitor"] not in {m["name"] for m in baseline["monitors"]}:
             continue
         try:
+            if state.get("profileJournal"):
+                actual = indexed(snapshot()["workspaces"], "id", "workspace").get(workspace["id"])
+                intended = {pin["id"]: pin["target"] for pin in state["profileJournal"]["pins"]}
+                intended.update({move["id"]: move["target"] for move in state["plan"]["workspaces"]})
+                if actual and actual["monitor"] not in (workspace["monitor"], intended.get(workspace["id"])):
+                    raise ValueError(f"Workspace {workspace['id']} moved externally; preserving its placement.")
             move_workspace(baseline, workspace["id"], workspace["monitor"], recovery=True)
         except Exception as error:
             errors.append(str(error))
@@ -617,6 +958,11 @@ def rollback(state):
         restore_view(baseline, recovery=True)
     except Exception as error:
         errors.append(f"Focus restoration: {error}")
+    if state.get("profileJournal"):
+        try:
+            finish_profile_rollback(state)
+        except Exception as error:
+            errors.append(str(error))
     positions = [{key: monitor[key] for key in POSITION} for monitor in baseline["monitors"]]
     moves = [{"id": w["id"], "target": w["monitor"]} for w in baseline["workspaces"] if w["id"] > 0]
     try:
@@ -642,8 +988,14 @@ def worker(root, token):
                 # Fresh authoritative preflight in the independent worker; no panel
                 # process can perform mutations before the rollback owner exists.
                 request = {"baseline": state["baseline"], "positions": state["plan"]["positions"],
-                           "workspaces": state["plan"]["workspaces"]}
-                validate(request)
+                           "workspaces": state["plan"]["workspaces"],
+                           "profileWorkspaces": state["plan"].get("profileWorkspaces")}
+                fresh = validate(request)
+                if fresh["profileWorkspaces"] is not None:
+                    if not set(fresh["removeWorkspaces"]) <= set(state["plan"]["removeWorkspaces"]):
+                        raise ValueError("The empty workspace set changed; refresh the profile draft.")
+                    if workspace_rules() != state["profileJournal"]["beforeRules"]:
+                        raise ValueError("Workspace rules changed before preview.")
                 with locked(root):
                     state = load(root, token)
                     if state.get("request") == "revert":
@@ -656,18 +1008,25 @@ def worker(root, token):
                     # Pin every output together: leaving an unchanged output on its
                     # existing 'auto' rule can move it when another output moves.
                     set_positions(state["baseline"], state["plan"]["positions"], force=True)
+                if state["plan"].get("profileWorkspaces") is not None:
+                    apply_profile(state)
+                if state["plan"]["displayChanges"] or state["plan"].get("profileWorkspaces") is not None:
                     # Installing monitor rules can reapply persistent workspace
                     # bindings. Reconcile the complete intended allocation after
                     # our own display mutation, not only explicit workspace moves.
                     targets = {w["id"]: w["monitor"] for w in state["baseline"]["workspaces"] if w["id"] > 0}
                     targets.update({move["id"]: move["target"] for move in state["plan"]["workspaces"]})
+                    targets.update({placement["id"]: placement["target"]
+                                    for placement in state["plan"].get("profileWorkspaces") or []})
                     for wid, target in targets.items():
                         move_workspace(state["baseline"], wid, target)
                 else:
                     for move in state["plan"]["workspaces"]:
                         move_workspace(state["baseline"], move["id"], move["target"], move["source"])
                 restore_view(state["baseline"])
-                settle(state["baseline"], state["plan"]["positions"], state["plan"]["workspaces"])
+                if state["plan"].get("profileWorkspaces") is not None:
+                    cleanup_profile(state, root)
+                settle_trial(state)
                 with locked(root):
                     latest = load(root, token)
                     state.update(request=latest.get("request", ""), state="pending", phase="waiting",
@@ -684,7 +1043,7 @@ def worker(root, token):
                             reason = "Preview expired without Apply; previous arrangement restored."
                             break
                         if state.get("request") == "keep":
-                            verify_arrangement(state["baseline"], state["plan"]["positions"], state["plan"]["workspaces"])
+                            verify_trial(state)
                             if time.monotonic() >= state["deadline"]:
                                 reason = "Preview expired without Apply; previous arrangement restored."
                                 break
@@ -692,7 +1051,7 @@ def worker(root, token):
                             save(root, state)
                             return
                     # Detect unplug/external changes during the countdown, not just on Keep.
-                    verify_arrangement(state["baseline"], state["plan"]["positions"], state["plan"]["workspaces"])
+                    verify_trial(state)
                     time.sleep(0.2)
         except Exception as error:
             failed = True

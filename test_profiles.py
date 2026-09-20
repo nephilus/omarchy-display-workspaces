@@ -26,8 +26,9 @@ class ProfileTests(unittest.TestCase):
              "width": 1920, "height": 1080, "refreshRate": 60, "scale": 1, "transform": 0,
              "x": 1920, "y": 0, "availableModes": ["1920x1080@60Hz", "1280x720@60Hz"]},
         ]
-        self.workspaces = [{"id": 1, "monitor": "DP-1"}, {"id": 2, "monitor": "HDMI-A-1"},
-                           {"id": -99, "monitor": "DP-1"}]
+        self.workspaces = [{"id": 1, "monitor": "DP-1", "windows": 1, "ispersistent": False},
+                           {"id": 2, "monitor": "HDMI-A-1", "windows": 0, "ispersistent": False},
+                           {"id": -99, "monitor": "DP-1", "windows": 0, "ispersistent": False}]
         self.addCleanup(patch.stopall)
         patch.dict(os.environ, {"XDG_CONFIG_HOME": str(self.root)}).start()
         patch.object(arrangement, "query", side_effect=self.query).start()
@@ -73,6 +74,8 @@ class ProfileTests(unittest.TestCase):
         self.assertEqual(loaded["positions"][0]["x"], 0)
         self.assertEqual(loaded["positions"][0]["transform"], 2)
         self.assertEqual(loaded["workspaces"], [{"id": 1, "source": "HDMI-A-1", "target": "DP-1"}])
+        self.assertEqual(loaded["profileWorkspaces"], [{"id": 1, "target": "DP-1"},
+                                                      {"id": 2, "target": "HDMI-A-1"}])
         self.assertEqual(arrangement.snapshot(), live_before)
         self.assertEqual(self.path.read_bytes(), bytes_before)
 
@@ -81,13 +84,16 @@ class ProfileTests(unittest.TestCase):
         self.raw[0].update(name="USB-C-9", id=100)
         self.raw[1].update(name="USB-C-8", id=101)
         self.raw.reverse()
-        self.workspaces = [{"id": 1, "monitor": "USB-C-8"}, {"id": 2, "monitor": "USB-C-9"}]
+        self.workspaces = [{"id": 1, "monitor": "USB-C-8", "windows": 1, "ispersistent": False},
+                           {"id": 2, "monitor": "USB-C-9", "windows": 0, "ispersistent": False}]
         catalog = profiles.catalog(arrangement)
         self.assertEqual(catalog["profiles"][0]["match"], "hardware")
         loaded = profiles.load(arrangement, self.selection(saved))
         self.assertEqual([p["name"] for p in loaded["positions"]], ["USB-C-9", "USB-C-8"])
         self.assertEqual(loaded["workspaces"], [{"id": 1, "source": "USB-C-8", "target": "USB-C-9"},
                                                  {"id": 2, "source": "USB-C-9", "target": "USB-C-8"}])
+        self.assertEqual(loaded["profileWorkspaces"], [{"id": 1, "target": "USB-C-9"},
+                                                      {"id": 2, "target": "USB-C-8"}])
 
     def test_different_serial_on_same_connector_never_falls_back(self):
         saved = self.save()
@@ -135,13 +141,38 @@ class ProfileTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "changed"):
             profiles.load(arrangement, self.selection(saved))
 
-    def test_missing_and_new_workspaces_are_non_destructive(self):
+    def test_missing_saved_workspaces_and_empty_extras_reconcile_only_in_draft(self):
+        self.workspaces = [{"id": wid, "monitor": "DP-1" if wid < 5 else "HDMI-A-1",
+                            "windows": 0, "ispersistent": False} for wid in range(1, 8)]
         saved = self.save()
-        self.workspaces = [{"id": 2, "monitor": "DP-1"}, {"id": 7, "monitor": "DP-1"}]
+        saved_bytes = self.path.read_bytes()
+        self.workspaces = self.workspaces[:6] + [
+            {"id": 8, "monitor": "DP-1", "windows": 0, "ispersistent": True},
+            {"id": 9, "monitor": "HDMI-A-1", "windows": 2, "ispersistent": False},
+            {"id": 10, "monitor": "DP-1", "ispersistent": False},
+            {"id": -99, "monitor": "DP-1", "windows": 0, "ispersistent": False},
+        ]
+        live_before = arrangement.snapshot()
         loaded = profiles.load(arrangement, self.selection(saved))
-        self.assertEqual(loaded["workspaces"], [{"id": 2, "source": "DP-1", "target": "HDMI-A-1"}])
-        self.assertIn("Skipped missing workspace IDs: 1", loaded["message"])
-        self.assertEqual(self.workspaces, loaded["baseline"]["workspaces"])
+        desired = [{"id": wid, "target": "DP-1" if wid < 5 else "HDMI-A-1"} for wid in range(1, 8)]
+        self.assertEqual(loaded["profileWorkspaces"], desired)
+        self.assertEqual(loaded["workspaces"], [])
+        self.assertEqual(loaded["removeWorkspaces"], [8])
+        validated = arrangement.validate({"baseline": loaded["baseline"], "positions": loaded["positions"],
+                                          "workspaces": [], "profileWorkspaces": desired}, live_before)
+        self.assertGreater(validated["workspaceChanges"], 0)
+        self.assertTrue(profiles.catalog(arrangement)["profiles"][0]["canLoad"])
+        self.assertEqual(arrangement.snapshot(), live_before)
+        self.assertEqual(self.path.read_bytes(), saved_bytes)
+
+    def test_profile_without_saved_positive_workspaces_does_not_authorize_cleanup(self):
+        self.workspaces = [self.workspaces[-1]]
+        saved = self.save()
+        self.workspaces.append({"id": 8, "monitor": "DP-1", "windows": 0, "ispersistent": False})
+        loaded = profiles.load(arrangement, self.selection(saved))
+        self.assertIsNone(loaded["profileWorkspaces"])
+        self.assertEqual(loaded["removeWorkspaces"], [])
+        self.assertEqual(loaded["workspaces"], [])
 
     def test_stale_live_geometry_mode_catalog_or_workspace_baseline_cannot_save(self):
         for change in (lambda: self.raw[0].update(x=1),

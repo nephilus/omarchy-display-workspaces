@@ -240,21 +240,22 @@ def draft_for(api, profile, current):
     positions = [{"name": mapping[index]["name"], **{key: monitor[key] for key in GEOMETRY}}
                  for index, monitor in enumerate(profile["monitors"])]
     existing = api.indexed(current.get("workspaces"), "id", "live workspace")
-    moves, missing = [], []
+    moves, desired = [], []
     for workspace in profile["workspaces"]:
-        wid = workspace["id"]
-        if wid not in existing:
-            missing.append(wid)
-            continue
-        source, target = existing[wid]["monitor"], mapping[workspace["monitor"]]["name"]
-        if source != target:
-            moves.append({"id": wid, "source": source, "target": target})
-    result = api.validate({"baseline": current, "positions": positions, "workspaces": moves}, current)
+        wid, target = workspace["id"], mapping[workspace["monitor"]]["name"]
+        desired.append({"id": wid, "target": target})
+        if wid in existing and existing[wid]["monitor"] != target:
+            moves.append({"id": wid, "source": existing[wid]["monitor"], "target": target})
+    result = api.validate({"baseline": current, "positions": positions, "workspaces": moves,
+                           "profileWorkspaces": desired or None}, current)
     for position in result["positions"]:
         position["logicalWidth"], position["logicalHeight"] = api.logical_size(position, position["transform"])
     reason = ("Unique hardware identities match; connector changes are supported." if match == "hardware" else
               "Port-dependent / weak identity match: serial identity is missing or duplicated. Verify the physical displays before Preview.")
-    return result, match, reason, missing
+    if desired:
+        reason += (" Preview restores all saved workspaces, including missing or empty ones, and retains them for this session."
+                   " Extra empty workspaces are removed; populated extras and extras with unknown window counts are preserved.")
+    return result, match, reason
 
 
 def live_or_error(api):
@@ -272,10 +273,8 @@ def listing(api, document, data, current=None, error=None):
         match, reason, can_load = "unavailable", error, False
         if current is not None:
             try:
-                _, match, reason, missing = draft_for(api, profile, current)
+                _, match, reason = draft_for(api, profile, current)
                 can_load = True
-                if missing:
-                    reason += " Missing saved workspaces will be skipped: " + ", ".join(map(str, missing)) + "."
             except (ValueError, KeyError, TypeError) as failure:
                 match, reason = "unavailable", str(failure)
         entries.append({"id": profile["id"], "name": profile["name"],
@@ -411,11 +410,11 @@ def load(api, request):
         check_request(request, original, ("id", "revision"))
         profile = selected(document, request)
         current = api.snapshot()
-        result, _, reason, missing = draft_for(api, profile, current)
+        result, _, reason = draft_for(api, profile, current)
         if read_store(path) != original:
             raise ValueError("Saved profiles changed while loading. Refresh and try again.")
         message = f"Loaded {profile['name']} into the draft only. {reason} Preview and Apply to change this session."
-        if missing:
-            message += " Skipped missing workspace IDs: " + ", ".join(map(str, missing)) + ". No workspaces were created."
         return {"ok": True, "profileId": profile["id"], "baseline": current,
-                "positions": result["positions"], "workspaces": result["workspaces"], "message": message}
+                "positions": result["positions"], "workspaces": result["workspaces"],
+                "profileWorkspaces": result["profileWorkspaces"],
+                "removeWorkspaces": result.get("removeWorkspaces", []), "message": message}

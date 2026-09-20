@@ -95,6 +95,12 @@ Version 2.2.1 fixes previews and recovery failing when Hyprland retires an empty
 
 Finish or revert active previews and wait for Forget to finish before updating. No profile, settings, or plugin-ID migration is required. Existing profiles remain compatible; the update does not load or apply them automatically.
 
+## Upgrading from 2.2.1
+
+Version 2.3 restores a profile's complete saved workspace set during Preview, including missing and empty workspaces. The draft identifies creations and empty-extra removals. Populated extras remain untouched; no windows are consolidated. Runtime-only persistence keeps saved workspaces available for the session and is covered by the independent rollback worker.
+
+Finish or revert active previews and wait for Forget before updating, then restart the shell to load the changed draft/worker contract. No profile-store, settings, or plugin-ID migration is required. Existing profiles now restore missing IDs rather than skipping them. Broad/named persistent rules and drafts leaving a display without a retained workspace fail closed; see [workspace restoration and recovery](USAGE.md#restoring-the-workspace-set).
+
 ## Updating
 
 For a native Git-managed installation:
@@ -144,6 +150,6 @@ omarchy-shell shell ping
 - **Unknown plugin command or missing host imports:** the installed Omarchy generation lacks this plugin API. Use a compatible Omarchy/Quickshell setup; copying the files into Waybar will not work.
 - **Duplicate plugin ID:** an existing `display.workspaces` installation must be migrated or updated, not installed a second time.
 - **Preview unavailable:** inspect the panel's reason. Geometry must be valid, the systemd user manager must work, and display changes require supported exact monitor declarations in the loaded `hypr.monitors` module. Refresh after a mode catalog changes; repair draft gaps/overlaps after changing resolution or scale.
-- **Profile unavailable:** all enabled displays must match without contradictory identities, and the saved mode/scale/layout must remain valid. Missing saved workspaces are skipped rather than recreated. Read the compatibility reason; Detect displays refreshes it. A malformed, newer-version, or unsafe store requires manual review, not resetting it blindly.
+- **Profile unavailable:** all enabled displays must match without contradictory identities, and the saved mode/scale/layout must remain valid. Missing saved workspaces are restored on Preview; empty extras are removed and populated extras preserved. Broad/named persistent workspace rules can prevent safe Preview, and every enabled display needs a retained workspace. Read the reason; Detect displays refreshes it. A malformed, newer-version, or unsafe store requires manual review, not resetting it blindly.
 - **Forget disabled:** dynamic/broad rules, ambiguous hardware identity, unsafe file ownership/permissions, or a stale catalog prevent destructive edits. Review the reason instead of bypassing it.
 - **Missing icons:** use the Nerd Font configured by Omarchy.

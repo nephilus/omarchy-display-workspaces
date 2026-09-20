@@ -69,6 +69,8 @@ Panel {
   }
   property var positions: []
   property var draft: []
+  property var profileWorkspaces: null
+  property var removeWorkspaces: []
   property var geometryNotices: ({})
   property string message: ""
   property bool messageIsError: false
@@ -266,7 +268,7 @@ Panel {
         || (action === "profile-save" && !profileNameValid)
         || (action === "profile-load" && !selectedProfile.canLoad)) return
     var entry = selectedProfile
-    var edited = hasDisplayEdits() || draft.some(function(w) { return w.source !== w.target })
+    var edited = hasDisplayEdits() || profileWorkspaces !== null || draft.some(function(w) { return w.source !== w.target })
     if (action === "profile-load" && !edited) {
       startProfile(action, { id: entry.id, revision: profileRevision })
       return
@@ -318,10 +320,7 @@ Panel {
       }
       adoptSnapshot(result.baseline)
       positions = result.positions.map(function(p) { return Object.assign({}, p) })
-      draft = draft.map(function(w) {
-        var move = result.workspaces.filter(function(m) { return m.id === w.id })[0]
-        return Object.assign({}, w, { target: move ? move.target : w.source })
-      })
+      adoptWorkspacePlan(result)
       geometryNotices = ({})
       message = ""
       messageIsError = false
@@ -451,6 +450,8 @@ Panel {
     onTriggered: Hyprland.refreshMonitors()
   }
   function adoptSnapshot(result) {
+    profileWorkspaces = null
+    removeWorkspaces = []
     liveBaseline = result
     displays = result.monitors.map(function(m) { return Object.assign({}, m, { label: m.name, icon: "\uf108" }) })
     unavailableMonitors = (result.unavailableMonitors || []).map(function(m) { return Object.assign({}, m, { label: m.name, icon: "\uf108" }) })
@@ -465,6 +466,24 @@ Panel {
     if (!displays.some(function(m) { return m.name === selectedName })) selectedName = displays.length ? displays[0].name : ""
     changed()
   }
+  function adoptWorkspacePlan(value) {
+    profileWorkspaces = value.profileWorkspaces ? value.profileWorkspaces.map(function(w) {
+      return { id: w.id, target: w.target }
+    }) : null
+    removeWorkspaces = (value.removeWorkspaces || []).slice()
+    var desired = profileWorkspaces || []
+    var moves = value.workspaces || []
+    var cards = draft.map(function(w) {
+      var target = desired.filter(function(m) { return m.id === w.id })[0]
+        || moves.filter(function(m) { return m.id === w.id })[0]
+      return Object.assign({}, w, { target: target ? target.target : w.source })
+    })
+    desired.forEach(function(w) {
+      if (!cards.some(function(card) { return card.id === w.id }))
+        cards.push({ id: w.id, name: String(w.id), windows: 0, source: null, target: w.target })
+    })
+    draft = cards.sort(function(a, b) { return a.id - b.id })
+  }
   function snapshot() {
     if (requestPending || trialActive || profileActive || statusProcess.running || validationProcess.running) return
     invalidateValidation()
@@ -473,7 +492,11 @@ Panel {
     request("snapshot")
   }
   function plan() {
-    return { baseline: liveBaseline, uiScreen: panelScreen, positions: positions, workspaces: draft.filter(function(w) { return w.source !== w.target }).map(function(w) { return { id: w.id, source: w.source, target: w.target } }) }
+    return { baseline: liveBaseline, uiScreen: panelScreen, positions: positions,
+      profileWorkspaces: profileWorkspaces,
+      workspaces: draft.filter(function(w) { return w.source !== null && w.source !== w.target }).map(function(w) {
+        return { id: w.id, source: w.source, target: w.target }
+      }) }
   }
   function logicalGeometry(display, position) {
     if (!display || !position) return null
@@ -599,8 +622,12 @@ Panel {
     moveDisplay(selectedName, x, y)
   }
   function stage(id, connector) {
-    if (!editable) return
+    if (!editable || removeWorkspaces.indexOf(id) >= 0) return
     draft = draft.map(function(w) { return Object.assign({}, w, { target: w.id === id ? connector : w.target }) })
+    if (profileWorkspaces !== null)
+      profileWorkspaces = profileWorkspaces.map(function(w) {
+        return w.id === id ? { id: w.id, target: connector } : w
+      })
     message = ""
     topologyNotice = ""
     changed()
@@ -626,6 +653,8 @@ Panel {
     secondsRemaining = Math.max(0, Number(result.secondsRemaining || 0))
     if (trialState === "kept" || trialState === "reverted" || trialState === "failed") {
       token = ""
+      profileWorkspaces = null
+      removeWorkspaces = []
       Hyprland.refreshMonitors()
       Hyprland.refreshWorkspaces()
       if (trialState === "kept") root.close()
@@ -654,12 +683,19 @@ Panel {
     }
     if (action === "snapshot") {
       if (requestProcess.topologyRevision !== topologyRevision) return
+      var profileDraft = profileWorkspaces !== null ? Object.assign(plan(), { removeWorkspaces: removeWorkspaces.slice() }) : null
       if (liveBaseline && snapshotSignature(liveBaseline) !== snapshotSignature(result)) {
-        var edited = draft.some(function(w) { return w.source !== w.target }) || hasDisplayEdits()
-        topologyNotice = edited ? "Displays changed. Pending edits were reset." : "Displays changed. Layout refreshed."
+        var edited = profileDraft !== null || draft.some(function(w) { return w.source !== w.target }) || hasDisplayEdits()
+        topologyNotice = profileDraft !== null ? "Displays changed. Profile draft retained; review its targets before Preview."
+          : edited ? "Displays changed. Pending edits were reset." : "Displays changed. Layout refreshed."
       }
       refreshPending = false
       adoptSnapshot(result)
+      if (profileDraft !== null) {
+        positions = profileDraft.positions
+        adoptWorkspacePlan(profileDraft)
+        changed()
+      }
     }
     else if (action === "forget") {
       forgetCandidate = null
@@ -676,14 +712,15 @@ Panel {
       if (result.token && (root.opened || result.uiScreen === panelScreen)) {
         adoptSnapshot(result.baseline)
         positions = result.plan.positions.map(function(p) { return Object.assign({}, p) })
-        draft = draft.map(function(w) {
-          var move = result.plan.workspaces.filter(function(m) { return m.id === w.id })[0]
-          return Object.assign({}, w, { target: move ? move.target : w.source })
-        })
+        adoptWorkspacePlan(result.plan)
         changeCount = result.plan.displayChanges + result.plan.workspaceChanges
         receiveState(result)
         refreshPending = snapshotSignature(result.baseline) !== monitorHealth
-      } else if (root.opened) refreshPending = true
+      } else if (root.opened) {
+        profileWorkspaces = null
+        removeWorkspaces = []
+        refreshPending = true
+      }
     } else receiveState(result)
   }
   onOpenedChanged: {
@@ -816,6 +853,7 @@ Panel {
       root.valid = result.ok === true
       root.validationMessage = result.message || (root.valid ? "Layout is safe to try." : "Invalid layout.")
       root.changeCount = root.valid ? Number(result.displayChanges || 0) + Number(result.workspaceChanges || 0) : 0
+      if (root.valid) root.removeWorkspaces = (result.removeWorkspaces || []).slice()
     }
   }
   Timer {
@@ -1143,6 +1181,19 @@ Panel {
             }
           }
         }
+        Text {
+          objectName: "profile-workspace-actions"
+          Accessible.name: text
+          width: parent.width
+          visible: root.page === 1 && root.profileWorkspaces !== null
+          text: "Preview restores all saved workspaces and retains them for this session. Extra empty workspaces are removed; populated extras and extras with unknown window counts are preserved."
+            + (root.removeWorkspaces.length ? "\nRemove empty workspaces on Preview: " + root.removeWorkspaces.join(", ") + "." : "")
+          color: Color.foreground
+          font.family: Style.font.family
+          font.pixelSize: Style.font.bodySmall
+          textFormat: Text.PlainText
+          wrapMode: Text.Wrap
+        }
         Item {
           width: parent.width
           height: columns.implicitHeight
@@ -1297,7 +1348,11 @@ Panel {
                         Drag.hotSpot.y: height / 2
                         Text {
                           anchors.centerIn: parent
-                          text: slot.modelData.name + " · " + slot.modelData.windows + (slot.modelData.windows === 1 ? " window" : " windows")
+                          objectName: "workspace-action-" + slot.modelData.id
+                          text: slot.modelData.name + (slot.modelData.source === null ? " · create on Preview"
+                            : root.removeWorkspaces.indexOf(slot.modelData.id) >= 0 ? " · remove on Preview"
+                            : " · " + (slot.modelData.windows === undefined || slot.modelData.windows === null ? "unknown windows"
+                              : slot.modelData.windows + (slot.modelData.windows === 1 ? " window" : " windows")))
                           color: Color.background
                           font.family: Style.font.family
                           font.pixelSize: Style.font.body
@@ -1305,7 +1360,7 @@ Panel {
                         MouseArea {
                           id: mouse
                           anchors.fill: parent
-                          enabled: root.editable && !displayColumn.displayData.reason
+                          enabled: root.editable && !displayColumn.displayData.reason && root.removeWorkspaces.indexOf(slot.modelData.id) < 0
                           preventStealing: true
                           drag.target: chip
                           cursorShape: drag.active ? Qt.ClosedHandCursor : Qt.OpenHandCursor
