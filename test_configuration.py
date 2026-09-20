@@ -116,6 +116,44 @@ class ConfigurationTests(unittest.TestCase):
         self.assertEqual(result["entries"], [])
         self.assertEqual(json.loads(self.paths[1].read_bytes())["bar"]["layout"]["left"][0]["displays"], [])
 
+    def test_moved_strong_identity_keeps_old_and_current_rules_independent(self):
+        for selected in ("B", "A"):
+            with self.subTest(selected=selected):
+                preferences = [{"connector": "B", "make": "Vendor", "model": "Panel",
+                                "serial": "one", "name": "Desk"}]
+                self.write_config(self.rule_a + "\n" + self.rule_b + "\n", preferences)
+                originals = [path.read_bytes() for path in self.paths]
+                result = self.worker(self.request(selected))
+                self.assertTrue(result["ok"], result)
+                if selected == "B":
+                    self.assertEqual(self.paths[0].read_text(), self.rule_a + "\n\n")
+                    self.assertEqual(self.paths[1].read_bytes(), originals[1])
+                    self.assertEqual([Path(path).read_bytes() for path in result["backupPaths"]], [originals[0]])
+                else:
+                    self.assertEqual(self.paths[0].read_text(), "\n" + self.rule_b + "\n")
+                    self.assertEqual(json.loads(self.paths[1].read_bytes())["bar"]["layout"]["left"][0]["displays"], [])
+                    self.assertEqual([Path(path).read_bytes() for path in result["backupPaths"]], originals)
+
+    def test_moved_weak_identity_cannot_choose_between_configured_connectors(self):
+        self.write_config(self.rule_a + "\n" + self.rule_b + "\n",
+                          [{"connector": "B", "make": "Vendor", "model": "Panel", "name": "Desk"}])
+        originals = [path.read_bytes() for path in self.paths]
+        for connector in ("A", "B"):
+            result = self.worker(self.request(connector))
+            self.assertFalse(result["ok"])
+            self.assertEqual([path.read_bytes() for path in self.paths], originals)
+
+    def test_duplicate_live_serials_still_block_both_connectors(self):
+        self.live.append(dict(self.live[0], name="B"))
+        self.write_config(self.rule_a + "\n" + self.rule_b + "\n",
+                          [{"connector": "B", "make": "Vendor", "model": "Panel",
+                            "serial": "one", "name": "Desk"}])
+        originals = [path.read_bytes() for path in self.paths]
+        for connector in ("A", "B"):
+            result = self.worker(self.request(connector))
+            self.assertFalse(result["ok"])
+            self.assertEqual([path.read_bytes() for path in self.paths], originals)
+
     def test_ambiguous_hardware_and_conflicting_saved_identities_are_refused(self):
         self.live.append(dict(self.live[0], name="B"))
         self.write_config(self.rule_a + "\n" + self.rule_b + "\n",

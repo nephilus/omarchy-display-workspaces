@@ -25,6 +25,8 @@ Use **Displays** to select a display on the map, choose its advertised resolutio
 3. Check the live result.
 4. Click **Apply** within the countdown to keep it, or cancel/wait to revert.
 
+**The 20 seconds is only the live confirmation window.** Take as long as needed to edit the draft before Preview. After Apply completes, there is no countdown for reopening Profiles and saving the confirmed arrangement.
+
 Apply keeps resolution, scale, rotation, and arrangement **for this session only**. It does not persist display settings or workspace bindings into Hyprland configuration. Reloading configuration or restarting the session can reapply your existing rules. Profiles are saved separately; automatic restoration is off unless explicitly enabled for a profile. The plugin does not provide automatic mode/scale selection, custom modelines, rotation editing, or HDR controls.
 
 Resolution choices come from the display's advertised modes. Refresh rates remain distinct, such as 59.94 Hz and 60 Hz. An active custom/unadvertised mode can be retained; if no modes are advertised, resolution selection is disabled rather than guessed.
@@ -38,6 +40,37 @@ Preview uses an independent systemd user worker, so a recreated bar does not eli
 Hyprland can create temporary replacement workspaces when an active workspace moves. In ordinary arrangement previews, workspaces known to be empty and nonpersistent at Preview start may disappear as focus changes; their disappearance does not fail Preview or recovery. Profile previews instead require every saved workspace to exist on its intended display and remain persistent for the session; only empty extras are retired.
 
 When an output reports zero size or other invalid geometry, healthy displays and workspace cards remain visible. Names/icons/order and the configuration catalog remain accessible; unsafe layout actions stay blocked. This protects against bad geometry but does not fix the underlying driver, cable, or compositor problem.
+
+### New connectors and session ownership
+
+Moving a display to a new HDMI/DP/USB-C connector no longer requires adding an exact rule for that connector before manual arrangement. With a supported monitor configuration, use the same Displays/Workspaces → Preview → Apply flow. The new path uses Hyprland's native output-management protocol to override geometry without replacing hidden ICC/HDR/VRR policy or writing `monitors.lua`. Existing exact-rule arrangements retain their original backend unless a session owner is already active.
+
+Hardware matching and applying geometry are separate steps. An existing profile can recognize the same physical monitor through its unique make/model/serial identity even when its connector name changes; native output management removes the subsequent missing-rule blocker for manual Preview. It also supports manually arranging a genuinely new display.
+
+To restore after a port change:
+
+1. Connect the display and choose **Detect displays** if discovery has not refreshed.
+2. In **Profiles**, select the existing profile and check compatibility. All enabled displays must match; a unique strong identity can match across connector names.
+3. Choose **Review layout**, inspect the draft without a time limit, then **Preview (20s) → Apply**.
+4. Save/update a profile only if you want to record a different arrangement. A connector-name change alone does not require a new profile when strong matching succeeds.
+
+To check rollback, preview a small reversible change and let it expire before repeating it and clicking Apply. Testing the missing-rule path requires a connector without an existing exact rule; do not delete working rules just to manufacture that test. Keep other display-configuration tools inactive during the check.
+
+One on-demand systemd user **session layout owner** keeps the native connection alive after Apply. It is event-driven while idle, not a polling or continual-restoration loop. The separate preview watchdog still owns the 20-second rollback and survives closing the panel. Cancelling an initial preview restores the baseline and releases the new owner; cancelling a later preview retains the previously kept layout. An owner restart adopts only still-matching before/after geometry, never replays a stale saved layout. No startup unit is installed, and it does not persist into a new compositor session.
+
+Connection changes, configuration-reload events, observed external geometry changes, or explicit release end ownership rather than enforcing the old arrangement. Recovery after these events is best-effort and may need manual arrangement. Use one display-configuration tool at a time: Hyprland gives older native output-management clients priority. A competing client can prevent a preview taking effect, and the watchdog then rejects it.
+
+Before editing monitor configuration, using another display tool, updating, or removing the plugin, finish/revert Preview and release any session owner from the plugin directory:
+
+```bash
+python3 apply.py release-layout
+```
+
+Release does not itself reload configuration or move windows. If a reload occurred while an owner was active, its override may have masked the configured geometry; after release, reload again when you intend to apply those rules. Forget releases ownership before its confirmed monitor-file changes and reload.
+
+The native path needs output-management version 2 or later and representable target **and rollback** geometry. Its scale range is 0.1–10; scales needing Hyprland's 1/120 correction require normal scale checks. An unadvertised current custom timing can remain unchanged, but this path refuses switching away from it when exact recovery cannot be established. Unsupported native capabilities fail with a reason before Preview; they do not fall back to guessed rules. Dynamic/broad/conditional monitor declarations remain unsupported.
+
+This is manual arrangement support, not automatic reconnect restoration on unconfigured connectors. Automatic restoration's exact-rule and explicit-consent requirements are unchanged; recognizing the display does not bypass those requirements.
 
 ## Manual profiles
 
@@ -75,7 +108,7 @@ Retention and cleanup use runtime-only workspace rules. No configuration files a
 - Missing saved workspace IDs are restored during Preview, not skipped. Empty extras are retired, while populated extras keep their placement unless explicitly moved in the draft. A profile with no saved positive workspace IDs changes geometry only and does not authorize workspace cleanup.
 - Unavailable modes, unsafe scales/layouts, disabled or mirrored outputs, and unusable geometry block saving or loading as applicable. An unadvertised custom mode can only be retained while it is already active.
 - Stored rotations are restored through the same preview transaction; there is no rotation editor. Loading normalizes the common origin without changing relative positions.
-- A hardware match does not bypass Preview's rule preflight: live display changes still require supported exact connector rules in the loaded `hypr.monitors` module, including after port renaming.
+- A hardware match does not bypass safety preflight. Manual Preview can use native session ownership when a connector has no exact rule; automatic display changes still require supported exact connector rules in the loaded `hypr.monitors` module.
 
 Unavailable profiles stay listed with a reason and can be deleted or have automation disabled without matching that display combination. Use **Detect displays** after an external display or configuration change.
 
@@ -126,6 +159,8 @@ The selector in **Workspaces** combines:
 Choose the entry, click **Forget display**, read the warning, then click **Confirm forget**. Cancel leaves files unchanged.
 
 For a supported configured monitor, confirmation removes its exact `hl.monitor(...)` declaration(s) from `~/.config/hypr/monitors.lua` and its matching saved customization from shell settings. A customization-only entry changes only shell settings. `XDG_CONFIG_HOME` is honored for these configuration paths.
+
+After a connector change, a unique live make/model/serial match associates saved customization with the current connector. An exact rule remaining for the old connector is a separate **Rule only** entry, not a second hardware identity. Forgetting that old entry preserves the current display's rule and customization; forgetting the current entry removes its rule and matching customization but leaves the old connector's rule. Weak identities cannot resolve competing configured connectors, and duplicate live hardware identities still block removal.
 
 Changed files are backed up before atomic replacement. Rule changes trigger `hyprctl reload` followed by a configuration-error check. An active display can immediately change mode or placement when its rule is removed. Forget does not unplug, disable, or permanently hide a monitor; compositor fallback rules may still configure it, and it can still appear among live outputs.
 

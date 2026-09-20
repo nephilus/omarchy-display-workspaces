@@ -19,6 +19,7 @@ import time
 import configuration as display_config
 import profiles as display_profiles
 import automation as display_automation
+import output_owner
 
 CONFIRM_SECONDS = 20
 COORD_LIMIT = 32768
@@ -207,25 +208,29 @@ def compare_outputs(before, after, catalog=False):
     return new
 
 
-def require_exact_rules(names):
-    # The public API cannot enumerate monitor rules. Fail closed unless the loaded
-    # Omarchy module uses plain, unconditional exact-selector declarations. Do not
-    # execute config again: that would itself change live display state.
+def check_monitor_rules(names, *, allow_new=False):
+    # Never execute user Lua to discover rules. Existing exact rules can be
+    # merged without replacing their policy; missing rules need the separate
+    # field-selective output-management backend, never a guessed Lua rule.
     loaded = run(["hyprctl", "repl",
                   'return package.loaded["hypr.monitors"], package.searchpath("hypr.monitors", package.path)'])
     parts = loaded.split("\t")
     if len(parts) != 2 or parts[0] != "true":
         raise ValueError("Cannot establish exact monitor rules safely; display changes are unavailable.")
-    rules = display_config.monitor_rules(Path(parts[1]).read_text())
+    source = display_config.read_file(Path(parts[1]))
+    if source is None:
+        raise ValueError("The loaded monitor configuration is unavailable.")
+    rules = display_config.monitor_rules(source.decode("utf-8"))
     if any(rule["reason"] for rule in rules):
         raise ValueError("Monitor rules must use plain exact connector declarations for safe display changes.")
     outputs = {rule["selector"] for rule in rules}
     missing = set(names) - outputs
-    if missing:
+    if missing and not allow_new:
         raise ValueError("No safe exact monitor rule for " + ", ".join(sorted(missing)) + ".")
+    return sorted(missing)
 
 
-def validate(request, current=None):
+def validate(request, current=None, *, allow_new=True):
     if not isinstance(request, dict) or not isinstance(request.get("baseline"), dict):
         raise ValueError("Missing live baseline. Refresh the panel.")
     baseline = request["baseline"]
@@ -337,7 +342,9 @@ def validate(request, current=None):
             raise ValueError("Keep at least one saved or populated workspace on every enabled display.")
     count = sum(not same_fields(p, monitors[p["name"]], POSITION) for p in normalized)
     if count and live_validation:
-        require_exact_rules(monitors)
+        missing = check_monitor_rules(monitors, allow_new=allow_new)
+        if missing:
+            output_owner.preflight(sys.modules[__name__], current, normalized)
     workspace_count = len({move["id"] for move in moves}
                           | {placement["id"] for placement in profile or []} | set(removals))
     return {"ok": True, "positions": normalized, "workspaces": moves, "profileWorkspaces": profile,
@@ -522,6 +529,8 @@ def cleanup_profile(state, root=None):
 
 def verify_trial(state):
     plan = state["plan"]
+    if state.get("outputOwner"):
+        output_owner.verify(sys.modules[__name__], runtime_dir(), state["outputOwner"])
     cleaned = set()
     if plan.get("profileWorkspaces") is not None:
         cleaned = profile_status(state)
@@ -637,8 +646,13 @@ def begin_locked(root, request, *, automatic_profile=None):
     require_no_preview(root)
     current = snapshot()
     plan = validate(request, current)
+    monitor_backend = "rules"
     if plan["displayChanges"]:
-        require_exact_rules(m["name"] for m in current["monitors"])
+        missing = check_monitor_rules((m["name"] for m in current["monitors"]),
+                                      allow_new=automatic_profile is None)
+        if missing or output_owner.active(sys.modules[__name__], root):
+            output_owner.preflight(sys.modules[__name__], current, plan["positions"])
+            monitor_backend = "output-management"
     if not plan["displayChanges"] and not plan["workspaceChanges"]:
         raise ValueError("There are no arrangement changes to try.")
     if not shutil.which("systemd-run") or not shutil.which("hyprctl"):
@@ -650,7 +664,7 @@ def begin_locked(root, request, *, automatic_profile=None):
     state = {"token": token, "state": "starting", "message": "Starting 20-second preview…",
              "baseline": current, "plan": plan, "request": "", "phase": "prepared",
              "created": time.monotonic(), "deadline": 0, "mutationStarted": False, "uiScreen": ui_screen,
-             "automatic": automatic_profile is not None}
+             "automatic": automatic_profile is not None, "monitorBackend": monitor_backend}
     if automatic_profile is not None:
         state.update(automaticProfile=automatic_profile, profileName=automatic_profile["name"],
                      message=f"Starting guarded automatic restoration of {automatic_profile['name']}…")
@@ -713,32 +727,38 @@ def monitor_guard(monitor):
             f"and not m.is_mirror, 'Display changed before mutation'); ")
 
 
-def set_positions(baseline, positions, force=False, recovery=False):
+def set_positions(baseline, positions, force=False, recovery=False, owner=None):
     current = snapshot()
     if not recovery:
         compare_outputs(baseline, current, catalog=True)
     original = indexed(baseline["monitors"], "name", "display")
     live = indexed(current["monitors"], "name", "display")
-    pieces = []
+    selected = []
     for position in positions:
         old, now = original[position["name"]], live.get(position["name"])
         if now is None or not same_identity(old, now):
             raise ValueError(f"Display {old['name']} disconnected or was replaced.")
         if not same_fields(old, now, GEOMETRY + ("x", "y")):
             raise ValueError(f"Display {old['name']} changed geometry; refusing a stale rule.")
-        if not force and same_fields(now, position, POSITION):
-            continue
-        # 0.56.2 merges the existing exact-selector rule, preserving unexposed
-        # ICC/HDR/VRR policy. Preflight rejects outputs without such a rule.
-        fields = {"output": old["name"], "position": f"{position['x']}x{position['y']}",
+        if force or not same_fields(now, position, POSITION):
+            selected.append(position)
+    if not selected:
+        return
+    if owner is not None:
+        output_owner.apply(sys.modules[__name__], runtime_dir(), current, selected, owner)
+        return
+    pieces = []
+    for position in selected:
+        now = live[position["name"]]
+        # Exact-selector merges preserve unexposed ICC/HDR/VRR policy.
+        fields = {"output": position["name"], "position": f"{position['x']}x{position['y']}",
                   "mode": f"{position['width']}x{position['height']}@{position['refreshRate']}",
                   "scale": position["scale"], "transform": position["transform"]}
         encoded = ','.join(f"{key}={lua_string(value) if isinstance(value, str) else value}" for key, value in fields.items())
         pieces.append((monitor_guard(now), f"hl.monitor({{{encoded}}}); "))
-    if pieces:
-        require_exact_rules(position["name"] for position in positions)
-        # Preflight ALL outputs in the compositor before installing ANY rule.
-        lua_eval(''.join("do " + guard + "end; " for guard, _ in pieces) + ''.join(code for _, code in pieces))
+    check_monitor_rules(position["name"] for position in selected)
+    # Preflight ALL outputs in the compositor before installing ANY rule.
+    lua_eval(''.join("do " + guard + "end; " for guard, _ in pieces) + ''.join(code for _, code in pieces))
 
 
 def workspace_may_expire(baseline, wid):
@@ -940,7 +960,7 @@ def rollback(state):
         if positions and state["plan"]["displayChanges"]:
             # Guard the observed mixture of before/after states: a failed batch or
             # restarted worker may have installed only some complete monitor rules.
-            set_positions(current, positions, force=True, recovery=True)
+            set_positions(current, positions, force=True, recovery=True, owner=state.get("outputOwner"))
     except Exception as error:
         errors.append(str(error))
     if state.get("profileJournal"):
@@ -1021,7 +1041,7 @@ def worker(root, token):
                     authorization = (display_automation.worker_request(sys.modules[__name__], state)
                                      if state.get("automatic", False) else contextlib.nullcontext(request))
                     with authorization as request:
-                        fresh = validate(request)
+                        fresh = validate(request, allow_new=not state.get("automatic", False))
                         if fresh["profileWorkspaces"] is not None:
                             if not set(fresh["removeWorkspaces"]) <= set(state["plan"]["removeWorkspaces"]):
                                 raise ValueError("The empty workspace set changed; refresh the profile draft.")
@@ -1036,11 +1056,15 @@ def worker(root, token):
                             data = display_profiles.read_store(display_profiles.store_path())
                             if display_config.digest(data) != state["automaticProfile"]["revision"]:
                                 raise ValueError("Saved profiles changed before automatic restoration.")
+                        if state.get("monitorBackend") == "output-management":
+                            state["outputOwner"] = output_owner.ensure(sys.modules[__name__], root)
+                            state["outputOwnerHadLayout"] = output_owner.call(root, {"command": "status"})["holding"]
                         state["mutationStarted"] = True
                         save(root, state)
                         if state["plan"]["displayChanges"]:
                             # Pin unchanged outputs too: 'auto' rules may otherwise move them.
-                            set_positions(state["baseline"], state["plan"]["positions"], force=True)
+                            set_positions(state["baseline"], state["plan"]["positions"], force=True,
+                                          owner=state.get("outputOwner"))
                         if state["plan"].get("profileWorkspaces") is not None:
                             apply_profile(state)
                 if state["plan"]["displayChanges"] or state["plan"].get("profileWorkspaces") is not None:
@@ -1092,6 +1116,8 @@ def worker(root, token):
                                 elif time.monotonic() >= state["deadline"]:
                                     reason = "Preview expired without Apply; previous arrangement restored."
                                     break
+                                if state.get("outputOwner"):
+                                    output_owner.finish(root, state["outputOwner"], keep=True)
                                 state.update(state="kept", phase="finished",
                                              message=(f"Automatic profile {state['profileName']} kept after 20 seconds of verification; session only."
                                                       if automatic else "Arrangement applied for this session only."))
@@ -1108,6 +1134,12 @@ def worker(root, token):
             state["phase"] = "rolling-back"
             save(root, state)
         errors = rollback(state) if state["mutationStarted"] else []
+        if state.get("outputOwner"):
+            try:
+                output_owner.finish(root, state["outputOwner"], keep=False,
+                                    retain=state.get("outputOwnerHadLayout", False))
+            except Exception as error:
+                errors.append(f"Session layout ownership: {error}")
         with locked(root):
             state.update(state="failed" if failed or errors else "reverted", phase="finished")
             if errors:
@@ -1188,6 +1220,10 @@ def forget_worker(root, token):
             return
         try:
             require_no_preview(root)
+            if state["phase"] == "prepared":
+                _, originals, replacements = display_config.prepare(sys.modules[__name__], state["request"])
+                if originals[0] != replacements[0]:
+                    output_owner.release(sys.modules[__name__], root)
             result = display_config.transact(sys.modules[__name__], root, state)
         except Exception as error:
             result = {"ok": False, "message": str(error)}
@@ -1211,6 +1247,17 @@ def main():
     if len(sys.argv) < 2:
         raise ValueError("Expected snapshot, resume, validate, begin, status, keep, or revert.")
     command = sys.argv[1]
+    if command == "output-owner" and len(sys.argv) == 2:
+        output_owner.serve(sys.modules[__name__], runtime_dir())
+        return {"ok": True, "message": "Session layout owner stopped."}
+    if command == "release-layout" and len(sys.argv) == 2:
+        root = runtime_dir()
+        with locked(root):
+            require_no_preview(root)
+            require_no_forget(root)
+            display_automation.suppress(sys.modules[__name__], root)
+            output_owner.release(sys.modules[__name__], root)
+        return {"ok": True, "message": "Session layout ownership released; configuration can reapply on reload."}
     if command == "snapshot" and len(sys.argv) == 2:
         return snapshot()
     if command == "configuration" and len(sys.argv) == 2:

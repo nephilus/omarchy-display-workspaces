@@ -273,8 +273,9 @@ def catalog(api):
                    (not record.get("serial") or m["serial"] == record["serial"])]
         ambiguity = len(matches) > 1
         target = matches[0] if len(matches) == 1 else connector
-        # Two different configured connectors cannot be collapsed using a hardware guess.
-        if target != connector and "connector:" + connector in entries:
+        # A unique serial-backed live match owns the preferences, not the old
+        # connector's rule. Keep that rule separate; weak identities cannot choose.
+        if target != connector and "connector:" + connector in entries and not record.get("serial"):
             ambiguity = True
         item = entry("connector:" + target if target else f"saved:{number}", connector=target)
         item["saved"] = True

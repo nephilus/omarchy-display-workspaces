@@ -34,7 +34,7 @@ class ProfileTests(unittest.TestCase):
         patch.object(arrangement, "query", side_effect=self.query).start()
         patch.object(arrangement, "run", side_effect=AssertionError("No live commands allowed")).start()
         patch.object(arrangement, "lua_eval", side_effect=AssertionError("No live mutations allowed")).start()
-        patch.object(arrangement, "require_exact_rules", side_effect=AssertionError("Profiles do not need Lua rules")).start()
+        patch.object(arrangement, "check_monitor_rules", side_effect=AssertionError("Profiles do not need Lua rules")).start()
 
     def query(self, kind, *args):
         return copy.deepcopy({"monitors": self.raw, "workspaces": self.workspaces, "activewindow": {}}[kind])
