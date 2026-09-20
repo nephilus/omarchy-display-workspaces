@@ -113,6 +113,16 @@ Workspace-focus recovery uses one reconnecting native event subscription shared 
 
 Old schema-1 stores are read without modification. The next confirmed profile change writes schema 2 and backs up the exact old bytes. Versions through 2.3 refuse schema 2; preserve the current store and review an old-format backup before downgrading, without blindly discarding later profile changes. See [automatic restoration, manual precedence, and limits](USAGE.md#optional-automatic-restoration).
 
+## Upgrading from 2.4
+
+Version 2.5 adds manual arrangement on newly named connectors without writing monitor rules. When needed, an on-demand, event-driven systemd user owner retains the native geometry override after Apply; the independent preview watchdog remains short-lived. No startup service, dependency, profile-store migration, or automatic profile consent is added. Native preflight checks both target and rollback geometry; see [session ownership and limitations](USAGE.md#new-connectors-and-session-ownership).
+
+Existing profiles can be reused after a connector rename when the complete display combination matches by strong hardware identity. No new profile is needed solely for the port change. Use **Detect displays → Profiles → Review layout → Preview → Apply**; automatic restoration still requires supported exact connector rules. The 20-second timer covers only live confirmation, not draft editing or saving a profile afterward.
+
+Forget now separates an obsolete connector rule from customization belonging to a uniquely identified live display on another connector. Removing the old rule preserves the current connector's rule and preferences. Weak or duplicate identities remain guarded.
+
+Finish/revert active operations before upgrading. Before subsequent updates or removal, also run `python3 apply.py release-layout` from the installed plugin directory to release any session owner. Existing profiles and display preferences remain intact.
+
 ## Updating
 
 For a native Git-managed installation:
@@ -129,11 +139,11 @@ If the UI remains cached after an update:
 omarchy restart shell
 ```
 
-Finish or revert any preview or automatic restoration before updating, moving, or removing the plugin: detached workers can still be using its Python files.
+Finish or revert any preview or automatic restoration before updating, moving, or removing the plugin. From its directory, also run `python3 apply.py release-layout`: a retained session owner may still be using its Python files. Release does not reload configuration or persist layout rules.
 
 ## Disable or remove
 
-First revert any active automatic restoration or finish/revert a manual preview. Disabling the widget stops observation of new connections; it does not stop an already-started independent worker.
+First revert any active automatic restoration or finish/revert a manual preview, then run `python3 apply.py release-layout` from the plugin directory. Disabling the widget stops observation of new connections; it does not stop an already-started watchdog or session owner.
 
 Restore the stock widget first if desired:
 
@@ -163,7 +173,7 @@ omarchy-shell shell ping
 
 - **Unknown plugin command or missing host imports:** the installed Omarchy generation lacks this plugin API. Use a compatible Omarchy/Quickshell setup; copying the files into Waybar will not work.
 - **Duplicate plugin ID:** an existing `display.workspaces` installation must be migrated or updated, not installed a second time.
-- **Preview unavailable:** inspect the panel's reason. Geometry must be valid, the systemd user manager must work, and display changes require supported exact monitor declarations in the loaded `hypr.monitors` module. Refresh after a mode catalog changes; repair draft gaps/overlaps after changing resolution or scale.
+- **Preview unavailable:** inspect the panel's reason. Geometry must be valid and the systemd user manager must work. Missing exact connector rules can use native output management for manual previews, provided the configuration is otherwise supported and both target and recovery geometry are representable. Refresh after a mode catalog changes; repair draft gaps/overlaps after changing resolution or scale. See [native limits and competing display tools](USAGE.md#new-connectors-and-session-ownership).
 - **Profile unavailable:** all enabled displays must match without contradictory identities, and the saved mode/scale/layout must remain valid. Missing saved workspaces are restored on Preview; empty extras are removed and populated extras preserved. Broad/named persistent workspace rules can prevent safe Preview, and every enabled display needs a retained workspace. Read the reason; Detect displays refreshes it. A malformed, newer-version, or unsafe store requires manual review, not resetting it blindly.
 - **Automatic restoration unavailable or skipped:** automation requires explicit opt-in for a currently-live saved arrangement with unique nonempty make/model/serial identities. A matching complete combination, valid rollback baseline, advertised modes, and supported exact rules are still required. Read **Details** for the reason. Open panels/manual operations suppress that episode; close the panel and use manual Review layout/Preview/Apply, or wait for another genuine reconnect. Updating a profile disables its opt-in. A reported successful check cannot guarantee the physical screen is visible.
 - **Forget disabled:** dynamic/broad rules, ambiguous hardware identity, unsafe file ownership/permissions, or a stale catalog prevent destructive edits. Review the reason instead of bypassing it.

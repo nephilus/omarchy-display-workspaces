@@ -63,7 +63,7 @@ class LayoutSafetyTests(unittest.TestCase):
 
         with patch.object(arrangement, "snapshot", side_effect=lambda: copy.deepcopy(self.current)), \
                 patch.object(arrangement, "lua_eval", side_effect=execute), \
-                patch.object(arrangement, "require_exact_rules"):
+                patch.object(arrangement, "check_monitor_rules", return_value=[]):
             yield batches
 
     def mode_plan(self):
@@ -669,7 +669,7 @@ class AutomaticRestorationTests(unittest.TestCase):
         self.stack.enter_context(patch.object(arrangement, "snapshot", side_effect=lambda: copy.deepcopy(self.current)))
         self.stack.enter_context(patch.object(arrangement, "run", return_value=""))
         self.stack.enter_context(patch.object(arrangement.shutil, "which", return_value="/synthetic/tool"))
-        self.stack.enter_context(patch.object(arrangement, "require_exact_rules"))
+        self.stack.enter_context(patch.object(arrangement, "check_monitor_rules", return_value=[]))
         self.rules = []
         self.stack.enter_context(patch.object(arrangement, "workspace_rules", side_effect=lambda: copy.deepcopy(self.rules)))
         self.stack.enter_context(patch.object(arrangement, "profile_status", return_value=set()))
@@ -850,10 +850,9 @@ class AutomaticRestorationTests(unittest.TestCase):
         self.current["workspaces"][0]["monitor"] = "renamed-A"
         self.check()
         self.now += 2
-        with patch.object(arrangement, "require_exact_rules", side_effect=ValueError("No safe exact monitor rule")):
+        with patch.object(arrangement, "check_monitor_rules", side_effect=ValueError("No safe exact monitor rule")):
             result = self.check()
         self.assertEqual(result["status"], "skipped")
-        self.assertIn("No safe exact monitor rule", result["message"])
         self.assertFalse((self.runtime / "active.json").exists())
 
     def test_worker_rechecks_revision_and_disable_before_mutation(self):

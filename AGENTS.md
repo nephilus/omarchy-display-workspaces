@@ -6,6 +6,8 @@ Omarchy Display Workspaces is a third-party Quickshell bar widget and compact di
 
 Keep the product narrow: multi-display workspace visibility, straightforward session arrangement with advertised resolution/refresh and scale controls, named live-arrangement profiles with optional strong-identity reconnect restoration, immediate presentation preferences, and deliberate configuration cleanup. Do not add automatic layout learning, individual-window tracking, rotation editing, HDR controls, dependencies, telemetry, or persistent background services without a request.
 
+An on-demand, event-driven, session-lived output owner is explicitly approved for manual new-connector arrangements. It retains only runtime geometry through the native output-management protocol; do not expand it into a startup service, layout learning, or continual enforcement.
+
 Read `README.md`, `docs/INSTALLATION.md`, and `docs/USAGE.md` before behavior changes. Follow `docs/AGENTS.md` when editing documentation or screenshots.
 
 ## Architecture
@@ -16,10 +18,12 @@ Read `README.md`, `docs/INSTALLATION.md`, and `docs/USAGE.md` before behavior ch
 - `ArrangePanel.qml`: draft layout/workspace state, catalog, confirmation, validation generations, worker responses.
 - `ArrangePopup.qml`, `DisplayMap.qml`: native popup and display geometry UI.
 - `apply.py`: discovery, validation, independent systemd preview/Forget workers, and runtime transaction state.
+- `output_management.py`: standard-library Wayland geometry transport, native head/mode validation and policy-preserving overrides.
+- `output_owner.py`: generation-guarded session ownership, runtime journal, restart adoption and explicit release.
 - `configuration.py`: nonexecuting Lua scanner, configuration/preference catalog, revisions, exact backups and guarded restoration.
 - `profiles.py`: versioned private profile store, guarded CRUD, hardware matching, and draft-only loading.
 - `automation.py`: per-session settled connection episodes, guarded automatic selection, and immutable unattended authorization.
-- `test_apply.py`, `test_configuration.py`, `test_profiles.py`: isolated Python behavioral regression coverage.
+- `test_apply.py`, `test_configuration.py`, `test_profiles.py`, `test_output_management.py`, `test_output_owner.py`: isolated Python behavioral regression coverage.
 
 There is no build step. Reuse Omarchy's host QML components and Python's standard library.
 
@@ -27,6 +31,7 @@ There is no build step. Reuse Omarchy's host QML components and Python's standar
 
 - **Display/workspace changes are session-only.** Manual Preview requires Apply within 20 seconds. Explicitly opted-in automatic restoration keeps only after its full 20-second health observation and authorization recheck. Both use the independent rollback worker; never silently persist Hyprland layout rules.
 - Mode/scale edits belong to the same complete draft transaction as positions. Validate advertised modes and whole logical pixels; preserve the original timing for an unchanged custom mode. Rollback may restore original geometry only when the live geometry still matches the original or intended target; preserve unrelated external changes.
+- Manual new-connector previews may use native geometry-only overrides without creating Lua rules. Keep the owner independent from the watchdog; an initial Revert releases it, later Revert preserves prior ownership, and Apply retains it for the session. Never infer absent ICC/HDR policy from monitor JSON. Preflight native target and rollback representation, preserve unchanged custom timings, and do not widen automatic restoration's exact-rule authorization.
 - Profiles save current live state, never untested draft edits. Manual loading only prepares a draft. Match all enabled displays one-to-one; conflicting nonempty identities must never fall back to the same connector. Weak matches require an explicit warning and are never automatic. Restoration must create and retain all saved positive workspace IDs, retire only atomically verified empty extras, and preserve populated/unknown-count extras and special workspaces. Runtime persistence and empty cleanup belong to the independent rollback transaction; preserve unrelated rule fields and external edits. Keep presentation settings separate.
 - Profile replacement/deletion and automation opt-in require immutable ID/revision confirmation and exact backups before atomic writes. New/replaced profiles are manual. Read schema 1 without writing, migrate only on guarded writes, and never infer consent. Refuse corrupt/unknown schemas and unsafe paths; never reset the store silently. Serialize storage across compositor sessions and block profile operations during preview/automatic restoration/Forget.
 - Automation needs a unique complete strong identity set, one enabled profile per combination, and a currently-live saved arrangement at opt-in. Settle actual connection changes; consume attempts before launch and suppress episodes for open panels/manual operations. No continual enforcement, idle polling, or guessing on weak/no/multiple matches. Guard store authorization before mutation and unattended keep; restart recovers rather than reapplies. Runtime lock precedes profile-store lock.
@@ -51,7 +56,7 @@ From the repository root:
 
 ```bash
 omarchy plugin validate .
-python3 -m unittest test_apply test_configuration test_profiles
+python3 -m unittest test_apply test_configuration test_profiles test_output_management test_output_owner
 ```
 
 For a backend behavioral change, exercise the changed path with isolated files, including relevant failure/recovery cases. A detached-worker change needs an actual worker-lifetime smoke, not only mocks. QML changes require opening the real components in a native harness or compatible Omarchy session; compilation alone is insufficient. Do not install extra tools merely to claim validation.
