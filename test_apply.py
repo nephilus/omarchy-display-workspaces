@@ -459,6 +459,193 @@ class LayoutSafetyTests(unittest.TestCase):
                 arrangement.save(root, state)
                 self.assertNotIn("token", arrangement.resume())
 
+    def profile_request(self):
+        self.current["workspaces"] = [
+            {"id": 1, "monitor": "A", "windows": 0, "ispersistent": False},
+            {"id": 2, "monitor": "B", "windows": 0, "ispersistent": True},
+            {"id": 4, "monitor": "B", "windows": 2, "ispersistent": False},
+            {"id": 5, "monitor": "A"},
+            {"id": -99, "monitor": "A", "windows": 0, "ispersistent": True},
+        ]
+        self.plan["baseline"] = copy.deepcopy(self.current)
+        self.plan["profileWorkspaces"] = [{"id": 1, "target": "A"}, {"id": 7, "target": "B"}]
+        return self.plan
+
+    def test_profile_validation_restores_missing_saved_ids_without_synthetic_moves(self):
+        request = self.profile_request()
+        plan = self.validate()
+        self.assertEqual(plan["profileWorkspaces"], request["profileWorkspaces"])
+        self.assertEqual(plan["workspaces"], [])
+        self.assertGreater(plan["workspaceChanges"], 0)
+        self.assertEqual(plan["removeWorkspaces"], [2])
+
+    def test_profile_cleanup_is_derived_and_preserves_populated_unknown_and_special(self):
+        request = self.profile_request()
+        request["removeWorkspaces"] = [1, 4, 5, -99]
+        plan = self.validate()
+        self.assertEqual(plan["removeWorkspaces"], [2])
+        self.current["workspaces"][1]["windows"] = 1
+        self.assertEqual(self.validate()["removeWorkspaces"], [])
+
+    def test_profile_retained_extra_can_move_but_retired_extra_cannot(self):
+        self.profile_request()
+        self.plan["workspaces"] = [{"id": 4, "source": "B", "target": "A"}]
+        self.assertEqual(self.validate()["workspaces"], self.plan["workspaces"])
+        self.plan["workspaces"] = [{"id": 2, "source": "B", "target": "A"}]
+        with self.assertRaisesRegex(ValueError, "retired"):
+            self.validate()
+
+    def test_profile_rejects_conflicting_card_targets_and_empty_display(self):
+        self.profile_request()
+        self.plan["workspaces"] = [{"id": 1, "source": "A", "target": "B"}]
+        with self.assertRaisesRegex(ValueError, "conflicting"):
+            self.validate()
+        self.plan["workspaces"] = []
+        self.plan["profileWorkspaces"][1]["target"] = "A"
+        self.current["workspaces"] = self.current["workspaces"][:2]
+        self.plan["baseline"] = copy.deepcopy(self.current)
+        with self.assertRaisesRegex(ValueError, "every enabled display"):
+            self.validate()
+
+    def test_profile_rejects_stale_saved_presence_or_placement(self):
+        self.profile_request()
+        self.current["workspaces"].append({"id": 7, "monitor": "B"})
+        with self.assertRaisesRegex(ValueError, "Saved workspace 7 changed"):
+            self.validate()
+        self.current["workspaces"].pop()
+        self.current["workspaces"][0]["monitor"] = "B"
+        with self.assertRaisesRegex(ValueError, "Saved workspace 1 changed"):
+            self.validate()
+
+    def test_profile_rejects_stale_extra_placement_without_overwriting_populated_extra(self):
+        self.profile_request()
+        extra = self.current["workspaces"][2]
+        extra["monitor"] = "A"
+        with self.assertRaisesRegex(ValueError, "Extra workspace 4 moved externally"):
+            self.validate()
+        self.assertEqual(extra, {"id": 4, "monitor": "A", "windows": 2, "ispersistent": False})
+
+    def test_profile_contract_rejects_empty_duplicate_invalid_and_unknown_targets(self):
+        self.profile_request()
+        for saved in ([], [{"id": 1, "target": "A"}, {"id": 1, "target": "B"}],
+                      [{"id": -1, "target": "A"}], [{"id": True, "target": "A"}],
+                      [{"id": 7, "target": "disconnected"}]):
+            with self.subTest(saved=saved):
+                self.plan["profileWorkspaces"] = saved
+                with self.assertRaises(ValueError):
+                    self.validate()
+
+    def test_profile_missing_saved_empty_workspace_never_gets_expiry_exemption(self):
+        self.profile_request()
+        baseline = copy.deepcopy(self.current)
+        self.current["workspaces"] = [w for w in self.current["workspaces"] if w["id"] != 1]
+        self.current["workspaces"].append({"id": 7, "monitor": "B", "windows": 0, "ispersistent": True})
+        with self.compositor():
+            with self.assertRaisesRegex(ValueError, "Workspace 1"):
+                arrangement.verify_arrangement(baseline, self.plan["positions"], [],
+                                               self.plan["profileWorkspaces"])
+
+    def test_profile_saved_workspace_requires_correct_target_and_session_retention(self):
+        self.profile_request()
+        baseline = copy.deepcopy(self.current)
+        self.current["workspaces"][0]["ispersistent"] = True
+        workspace = {"id": 7, "monitor": "B", "windows": 0, "ispersistent": True}
+        self.current["workspaces"].append(workspace)
+        with self.compositor():
+            arrangement.verify_arrangement(baseline, self.plan["positions"], [],
+                                           self.plan["profileWorkspaces"])
+            workspace["ispersistent"] = False
+            with self.assertRaisesRegex(ValueError, "retained for the session"):
+                arrangement.verify_arrangement(baseline, self.plan["positions"], [],
+                                               self.plan["profileWorkspaces"])
+            workspace.update(ispersistent=True, monitor="A")
+            with self.assertRaisesRegex(ValueError, "intended display B"):
+                arrangement.verify_arrangement(baseline, self.plan["positions"], [],
+                                               self.plan["profileWorkspaces"])
+
+    def test_profile_cleanup_verification_requires_retirement_but_preserves_arriving_windows(self):
+        self.profile_request()
+        baseline = copy.deepcopy(self.current)
+        self.current["workspaces"][0]["ispersistent"] = True
+        self.current["workspaces"].append({"id": 7, "monitor": "B", "windows": 0, "ispersistent": True})
+        extra = self.current["workspaces"][1]
+        with self.compositor():
+            with self.assertRaisesRegex(ValueError, "did not retire"):
+                arrangement.verify_arrangement(baseline, self.plan["positions"], [],
+                                               self.plan["profileWorkspaces"], {2})
+            extra["windows"] = 1
+            arrangement.verify_arrangement(baseline, self.plan["positions"], [],
+                                           self.plan["profileWorkspaces"], {2})
+            self.current["workspaces"].remove(extra)
+            arrangement.verify_arrangement(baseline, self.plan["positions"], [],
+                                           self.plan["profileWorkspaces"], {2})
+
+    def test_profile_workspace_only_keep_and_resume_require_complete_restoration(self):
+        self.profile_request()
+        plan = self.validate()
+        token = "e" * 48
+        state = {"token": token, "state": "pending", "phase": "waiting", "request": "",
+                 "deadline": 100, "message": "Preview", "baseline": self.plan["baseline"], "plan": plan}
+        state["profileJournal"] = arrangement.prepare_profile(state, [])
+        rules = arrangement.expected_profile_rules(state, {2})
+        self.current["workspaces"] = [w for w in self.current["workspaces"] if w["id"] != 2]
+        self.current["workspaces"][0]["ispersistent"] = True
+        with tempfile.TemporaryDirectory() as directory, self.compositor():
+            root = Path(directory)
+            arrangement.save(root, state)
+            arrangement.atomic(root, "active.json", {"token": token})
+            with patch.object(arrangement, "runtime_dir", return_value=root), \
+                    patch.object(arrangement, "profile_status", return_value={2}), \
+                    patch.object(arrangement, "workspace_rules", return_value=rules):
+                self.assertEqual(arrangement.resume()["plan"]["profileWorkspaces"], plan["profileWorkspaces"])
+                with self.assertRaisesRegex(ValueError, "Workspace 7"):
+                    arrangement.control("keep", token)
+                self.assertEqual(arrangement.load(root, token)["request"], "")
+                self.current["workspaces"].append({"id": 7, "monitor": "B", "windows": 0, "ispersistent": True})
+                arrangement.control("keep", token)
+                self.assertEqual(arrangement.load(root, token)["request"], "keep")
+
+    def test_profile_worker_rejects_rule_drift_before_any_mutation(self):
+        self.profile_request()
+        plan = self.validate()
+        token = "f" * 48
+        state = {"token": token, "state": "starting", "phase": "prepared", "request": "",
+                 "message": "Starting", "mutationStarted": False, "baseline": self.plan["baseline"], "plan": plan}
+        state["profileJournal"] = arrangement.prepare_profile(state, [])
+        before = copy.deepcopy(self.current)
+        with tempfile.TemporaryDirectory() as directory, self.compositor(), \
+                patch.object(arrangement, "workspace_rules",
+                             return_value=[{"workspaceString": "1", "enabled": True, "persistent": True}]):
+            root = Path(directory)
+            arrangement.save(root, state)
+            arrangement.worker(root, token)
+            finished = arrangement.load(root, token)
+        self.assertEqual(finished["state"], "failed")
+        self.assertFalse(finished["mutationStarted"])
+        self.assertEqual(self.current, before)
+
+    def test_profile_verification_rejects_rule_edits_even_when_positions_match(self):
+        self.profile_request()
+        state = {"token": "a" * 48, "baseline": self.plan["baseline"], "plan": self.validate()}
+        state["profileJournal"] = arrangement.prepare_profile(state, [])
+        rules = arrangement.expected_profile_rules(state, set())
+        rules[0]["monitor"] = "B"
+        with self.compositor(), patch.object(arrangement, "profile_status", return_value=set()), \
+                patch.object(arrangement, "workspace_rules", return_value=rules):
+            with self.assertRaisesRegex(ValueError, "rules changed externally"):
+                arrangement.verify_trial(state)
+
+    def test_profile_rollback_preserves_external_workspace_move(self):
+        self.profile_request()
+        state = {"token": "b" * 48, "baseline": self.plan["baseline"], "plan": self.validate()}
+        state["profileJournal"] = arrangement.prepare_profile(state, [])
+        self.current["workspaces"][0]["monitor"] = "B"
+        with self.compositor(), patch.object(arrangement, "workspace_rules", return_value=[]), \
+                patch.object(arrangement.time, "monotonic", side_effect=[0, 4]):
+            errors = arrangement.rollback(state)
+        self.assertTrue(any("moved externally" in error for error in errors))
+        self.assertEqual(self.current["workspaces"][0]["monitor"], "B")
+
 
 if __name__ == "__main__":
     unittest.main()
