@@ -27,6 +27,7 @@ TERMINAL = {"kept", "reverted", "failed"}
 IDENTITY = ("id", "name", "description", "make", "model", "serial")
 GEOMETRY = ("width", "height", "scale", "transform", "refreshRate", "disabled", "mirrorOf")
 POSITION = ("name", "x", "y", "width", "height", "refreshRate", "scale", "transform")
+TARGET = POSITION + ("enabled",)
 SETTINGS = ("currentFormat", "colorManagementPreset", "sdrBrightness", "sdrSaturation",
             "sdrMinLuminance", "sdrMaxLuminance", "vrr")
 TOKEN_RE = re.compile(r"[0-9a-f]{48}\Z")
@@ -120,13 +121,23 @@ def logical_size(position, transform):
 
 
 def expected_outputs(baseline, positions):
-    targets = indexed(positions, "name", "display position")
-    monitors = []
-    for monitor in baseline["monitors"]:
-        expected = {**monitor, **targets.get(monitor["name"], {})}
-        expected["logicalWidth"], expected["logicalHeight"] = logical_size(expected, expected["transform"])
-        monitors.append(expected)
-    return {**baseline, "monitors": monitors}
+    targets = indexed(positions, "name", "display target")
+    enabled, disabled = [], []
+    connected = baseline["monitors"] + baseline.get("restorableMonitors", [])
+    for monitor in connected:
+        target = targets.get(monitor["name"])
+        if target is None or target.get("enabled", True):
+            expected = {**monitor, **(target or {})}
+            if monitor.get("disabled") is True:
+                expected["disabled"] = False
+            expected["logicalWidth"], expected["logicalHeight"] = logical_size(expected, expected["transform"])
+            enabled.append(expected)
+        else:
+            disabled.append({key: monitor.get(key) for key in IDENTITY} | {"disabled": True})
+    known = {m["name"] for m in connected}
+    disabled.extend(m for m in baseline.get("disabledMonitors", [])
+                    if m["name"] not in known)
+    return {**baseline, "monitors": enabled, "disabledMonitors": disabled}
 
 
 def snapshot():
@@ -168,10 +179,15 @@ def snapshot():
             continue
         monitor["modeOptions"] = mode_options(monitor.get("availableModes"))
         monitors.append(monitor)
-    return {"ok": True, "message": "Live layout loaded.", "monitors": monitors,
-            "disabledMonitors": disabled, "mirroredOutputs": mirrors, "unavailableMonitors": unavailable,
-            "workspaces": query("workspaces"), "activeWindow": query("activewindow").get("address", ""),
-            "session": os.environ.get("HYPRLAND_INSTANCE_SIGNATURE", "")}
+    result = {"ok": True, "message": "Live layout loaded.", "monitors": monitors,
+              "disabledMonitors": disabled, "mirroredOutputs": mirrors, "unavailableMonitors": unavailable,
+              "workspaces": query("workspaces"), "activeWindow": query("activewindow").get("address", ""),
+              "session": os.environ.get("HYPRLAND_INSTANCE_SIGNATURE", "")}
+    result["restorableMonitors"] = output_owner.restorable(sys.modules[__name__], runtime_dir(), result)
+    result["redockMonitors"] = output_owner.redock_layout(sys.modules[__name__], runtime_dir(), result)
+    result["redockWorkspaces"] = output_owner.redock_workspaces(
+        sys.modules[__name__], runtime_dir(), result)
+    return result
 
 
 def require_usable_outputs(*snapshots):
@@ -237,12 +253,31 @@ def validate(request, current=None, *, allow_new=True):
     live_validation = current is None
     current = snapshot() if current is None else current
     monitors = compare_outputs(baseline, current, catalog=True)
-    positions = indexed(request.get("positions"), "name", "display position")
-    if positions.keys() != monitors.keys():
-        raise ValueError("Provide exactly one position for every enabled display.")
-    normalized, sizes = [], {}
+    active = dict(monitors)
+    restorable = indexed(baseline.get("restorableMonitors", []), "name", "restorable display")
+    live_restorable = indexed(current.get("restorableMonitors", []), "name", "restorable display")
+    if restorable.keys() != live_restorable.keys() or any(
+            not same_fields(m, live_restorable[name], IDENTITY + GEOMETRY + SETTINGS + ("x", "y"))
+            for name, m in restorable.items()):
+        raise ValueError("Restorable disabled displays changed. Refresh the panel.")
+    redock = indexed(baseline.get("redockMonitors", []), "name", "redock display")
+    live_redock = indexed(current.get("redockMonitors", []), "name", "redock display")
+    if redock.keys() != live_redock.keys() or any(
+            not same_fields(m, live_redock[name], IDENTITY + GEOMETRY + SETTINGS + ("x", "y"))
+            for name, m in redock.items()):
+        raise ValueError("Redock geometry changed. Refresh the panel.")
+    if baseline.get("redockWorkspaces", []) != current.get("redockWorkspaces", []):
+        raise ValueError("Redock workspace journal changed. Refresh the panel.")
+    candidates = {**active, **restorable}
+    positions = indexed(request.get("positions"), "name", "display target")
+    if positions.keys() != candidates.keys():
+        raise ValueError("Provide exactly one target for every available display.")
+    normalized, sizes, enabled_names = [], {}, set()
     for name, position in positions.items():
-        monitor = monitors[name]
+        monitor = candidates[name]
+        enabled = position.get("enabled", True)
+        if type(enabled) is not bool:
+            raise ValueError("Display enabled state must be explicit.")
         target = {"name": name,
                   "x": numeric(position.get("x"), "X coordinate", -COORD_LIMIT, COORD_LIMIT, True),
                   "y": numeric(position.get("y"), "Y coordinate", -COORD_LIMIT, COORD_LIMIT, True),
@@ -250,30 +285,37 @@ def validate(request, current=None, *, allow_new=True):
                   "height": numeric(position.get("height"), "display height", 1, 65536, True),
                   "refreshRate": numeric(position.get("refreshRate"), "display refresh rate", 0.001, 1000),
                   "scale": numeric(position.get("scale"), "display scale", 0.1, 16),
-                  "transform": numeric(position.get("transform"), "display rotation", 0, 7, True)}
+                  "transform": numeric(position.get("transform"), "display rotation", 0, 7, True),
+                  "enabled": enabled,
+                  "modeOptions": monitor.get("modeOptions", [])}
         mode_keys = ("width", "height", "refreshRate")
         if same_fields(monitor, target, mode_keys):
-            # Retain the exact active timing, including unadvertised custom modes.
             target.update({key: monitor[key] for key in mode_keys})
         else:
-            advertised = next((mode for mode in monitor["modeOptions"] if same_fields(mode, target, mode_keys)), None)
+            advertised = next((mode for mode in monitor.get("modeOptions", [])
+                               if same_fields(mode, target, mode_keys)), None)
             if advertised is None:
                 raise ValueError(f"Display {name}: requested mode is not advertised. Refresh the panel.")
             target.update({key: advertised[key] for key in mode_keys})
         sizes[name] = logical_size(target, target["transform"])
         target["scale"] = round(target["scale"] * 120) / 120
         normalized.append(target)
-    min_x, min_y = min(p["x"] for p in normalized), min(p["y"] for p in normalized)
-    for position in normalized:
+        if enabled:
+            enabled_names.add(name)
+    if not enabled_names:
+        raise ValueError("Keep at least one display enabled.")
+    enabled_positions = [position for position in normalized if position["enabled"]]
+    min_x, min_y = min(p["x"] for p in enabled_positions), min(p["y"] for p in enabled_positions)
+    for position in enabled_positions:
         position["x"] -= min_x
         position["y"] -= min_y
         width, height = sizes[position["name"]]
         if position["x"] + width > COORD_LIMIT or position["y"] + height > COORD_LIMIT:
             raise ValueError("The display layout is too large.")
-    edges = {p["name"]: set() for p in normalized}
-    for index, a in enumerate(normalized):
+    edges = {p["name"]: set() for p in enabled_positions}
+    for index, a in enumerate(enabled_positions):
         aw, ah = sizes[a["name"]]
-        for b in normalized[index + 1:]:
+        for b in enabled_positions[index + 1:]:
             bw, bh = sizes[b["name"]]
             dx = min(a["x"] + aw, b["x"] + bw) - max(a["x"], b["x"])
             dy = min(a["y"] + ah, b["y"] + bh) - max(a["y"], b["y"])
@@ -282,14 +324,37 @@ def validate(request, current=None, *, allow_new=True):
             if (dx == 0 and dy > 0) or (dy == 0 and dx > 0):
                 edges[a["name"]].add(b["name"])
                 edges[b["name"]].add(a["name"])
-    reached, pending = set(), [normalized[0]["name"]]
+    reached, pending = set(), [enabled_positions[0]["name"]]
     while pending:
         name = pending.pop()
         if name not in reached:
             reached.add(name)
             pending.extend(edges[name] - reached)
-    if reached != monitors.keys():
-        raise ValueError("Displays must share an edge; gaps and corner-only contact are not allowed.")
+    if reached != enabled_names:
+        raise ValueError("Enabled displays must share an edge; gaps and corner-only contact are not allowed.")
+    undock = request.get("undock", False)
+    if type(undock) is not bool:
+        raise ValueError("Invalid safe-undock request.")
+    if undock:
+        if not enabled_names or any(not name.startswith("eDP-") for name in enabled_names):
+            raise ValueError("Undock safely must leave only a healthy internal display enabled.")
+        if not any(name in active and not positions[name].get("enabled", True)
+                   for name in active if not name.startswith("eDP-")):
+            raise ValueError("Undock safely requires at least one enabled external display.")
+    commit = request.get("commit", "")
+    if commit not in ("", "undock", "redock"):
+        raise ValueError("Invalid immediate topology action.")
+    if commit == "undock" and not undock:
+        raise ValueError("Immediate undock requires the safe-undock topology.")
+    if commit == "redock":
+        if undock or not baseline.get("restorableMonitors"):
+            raise ValueError("Redock safely requires displays disabled by this session.")
+        if enabled_names != set(candidates):
+            raise ValueError("Redock safely must enable every available display.")
+        targets = indexed(normalized, "name", "redock target")
+        if redock.keys() != targets.keys() or any(
+                not same_fields(monitor, targets[name], POSITION) for name, monitor in redock.items()):
+            raise ValueError("Redock safely must restore the complete journaled display layout.")
     changes = indexed(request.get("workspaces"), "id", "workspace move")
     old_ws = indexed(baseline.get("workspaces"), "id", "baseline workspace")
     live_ws = indexed(current["workspaces"], "id", "live workspace")
@@ -297,13 +362,32 @@ def validate(request, current=None, *, allow_new=True):
     for wid, change in changes.items():
         numeric(wid, "workspace ID", 1, 2147483647, True)
         source, target = change.get("source"), change.get("target")
-        if not isinstance(source, str) or not isinstance(target, str) or source not in monitors or target not in monitors:
-            raise ValueError("A workspace refers to a missing display.")
+        if (not isinstance(source, str) or not isinstance(target, str)
+                or source not in active or target not in enabled_names):
+            raise ValueError("A workspace refers to a disabled or missing display.")
         if wid not in old_ws or wid not in live_ws or old_ws[wid]["monitor"] != source or live_ws[wid]["monitor"] != source:
             raise ValueError(f"Workspace {wid} moved or disappeared. Refresh the panel.")
         if source == target:
             raise ValueError("Include only changed workspace placements.")
         moves.append({"id": wid, "source": source, "target": target})
+    if commit == "redock":
+        saved_redock = indexed(baseline.get("redockWorkspaces", []), "id", "redock workspace")
+        redock_state = {"workspaces": list(saved_redock.values())}
+        for wid, saved in saved_redock.items():
+            live = live_ws.get(wid)
+            if live is None:
+                if workspace_may_expire(redock_state, wid):
+                    continue
+                raise ValueError(f"Redock workspace {wid} disappeared.")
+            target = changes.get(wid, {}).get("target", live["monitor"])
+            if saved.get("monitor") not in enabled_names or target != saved.get("monitor"):
+                raise ValueError(f"Redock safely must restore workspace {wid} to {saved.get('monitor')}.")
+    disabling = {name for name in active if name not in enabled_names}
+    unmoved = sorted(wid for wid, workspace in old_ws.items()
+                     if wid > 0 and workspace.get("monitor") in disabling and wid not in changes)
+    if unmoved:
+        raise ValueError("Move every workspace off displays being disabled: "
+                         + ", ".join(map(str, unmoved)) + ".")
     profile = request.get("profileWorkspaces")
     removals = []
     if profile is not None:
@@ -314,8 +398,8 @@ def validate(request, current=None, *, allow_new=True):
         for wid, placement in saved.items():
             numeric(wid, "profile workspace ID", 1, 2147483647, True)
             target = placement.get("target")
-            if not isinstance(target, str) or target not in monitors:
-                raise ValueError("A saved workspace refers to a missing display.")
+            if not isinstance(target, str) or target not in enabled_names:
+                raise ValueError("A saved workspace refers to a disabled or missing display.")
             old, live = old_ws.get(wid), live_ws.get(wid)
             if (old is None) != (live is None) or old and old["monitor"] != live["monitor"]:
                 raise ValueError(f"Saved workspace {wid} changed. Refresh the panel.")
@@ -338,17 +422,31 @@ def validate(request, current=None, *, allow_new=True):
         retained = {w["id"]: w["monitor"] for w in live_ws.values() if w["id"] > 0 and w["id"] not in removals}
         retained.update({move["id"]: move["target"] for move in moves})
         retained.update({placement["id"]: placement["target"] for placement in profile})
-        if set(retained.values()) != set(monitors):
+        if set(retained.values()) != enabled_names:
             raise ValueError("Keep at least one saved or populated workspace on every enabled display.")
-    count = sum(not same_fields(p, monitors[p["name"]], POSITION) for p in normalized)
+    state_changes = sum(position.get("enabled", True) != (name in active)
+                        for name, position in positions.items())
+    if state_changes and profile is not None:
+        raise ValueError("Enable-state changes cannot be combined with a loaded profile draft.")
+    if commit and not state_changes:
+        raise ValueError("Immediate topology action has no display state change.")
+    count = sum(position["enabled"] != (position["name"] in active)
+                or position["enabled"] and not same_fields(position, candidates[position["name"]], POSITION)
+                for position in normalized)
+    if not state_changes:
+        normalized = [{key: position[key] for key in POSITION} for position in normalized]
     if count and live_validation:
-        missing = check_monitor_rules(monitors, allow_new=allow_new)
-        if missing:
+        if state_changes:
             output_owner.preflight(sys.modules[__name__], current, normalized)
+        else:
+            missing = check_monitor_rules(active, allow_new=allow_new)
+            if missing:
+                output_owner.preflight(sys.modules[__name__], current, normalized)
     workspace_count = len({move["id"] for move in moves}
                           | {placement["id"] for placement in profile or []} | set(removals))
     return {"ok": True, "positions": normalized, "workspaces": moves, "profileWorkspaces": profile,
-            "removeWorkspaces": removals, "displayChanges": count, "workspaceChanges": workspace_count,
+            "removeWorkspaces": removals, "displayChanges": count, "enableChanges": state_changes,
+            "workspaceChanges": workspace_count, "commit": commit,
             "message": (f"{count} display change(s), {workspace_count} workspace change(s)."
                         + (f" Restore/retain {len(profile)} saved workspace(s); retire {len(removals)} empty extra(s)."
                            if profile is not None else ""))}
@@ -648,11 +746,17 @@ def begin_locked(root, request, *, automatic_profile=None):
     plan = validate(request, current)
     monitor_backend = "rules"
     if plan["displayChanges"]:
-        missing = check_monitor_rules((m["name"] for m in current["monitors"]),
-                                      allow_new=automatic_profile is None)
-        if missing or output_owner.active(sys.modules[__name__], root):
+        if plan.get("enableChanges"):
+            if automatic_profile is not None:
+                raise ValueError("Automatic restoration cannot change enabled displays.")
             output_owner.preflight(sys.modules[__name__], current, plan["positions"])
             monitor_backend = "output-management"
+        else:
+            missing = check_monitor_rules((m["name"] for m in current["monitors"]),
+                                          allow_new=automatic_profile is None)
+            if missing or output_owner.active(sys.modules[__name__], root):
+                output_owner.preflight(sys.modules[__name__], current, plan["positions"])
+                monitor_backend = "output-management"
     if not plan["displayChanges"] and not plan["workspaceChanges"]:
         raise ValueError("There are no arrangement changes to try.")
     if not shutil.which("systemd-run") or not shutil.which("hyprctl"):
@@ -729,6 +833,11 @@ def monitor_guard(monitor):
 
 def set_positions(baseline, positions, force=False, recovery=False, owner=None):
     current = snapshot()
+    if owner is not None:
+        if not recovery:
+            compare_outputs(baseline, current, catalog=True)
+        output_owner.apply(sys.modules[__name__], runtime_dir(), current, positions, owner)
+        return
     if not recovery:
         compare_outputs(baseline, current, catalog=True)
     original = indexed(baseline["monitors"], "name", "display")
@@ -744,9 +853,6 @@ def set_positions(baseline, positions, force=False, recovery=False, owner=None):
             selected.append(position)
     if not selected:
         return
-    if owner is not None:
-        output_owner.apply(sys.modules[__name__], runtime_dir(), current, selected, owner)
-        return
     pieces = []
     for position in selected:
         now = live[position["name"]]
@@ -761,6 +867,29 @@ def set_positions(baseline, positions, force=False, recovery=False, owner=None):
     lua_eval(''.join("do " + guard + "end; " for guard, _ in pieces) + ''.join(code for _, code in pieces))
 
 
+def apply_topology(current, positions):
+    """Apply a complete enabled topology through Hyprland's Lua monitor rules."""
+    live = indexed(current["monitors"], "name", "display")
+    disabled = indexed(current.get("disabledMonitors", []), "name", "disabled display")
+    targets = indexed(positions, "name", "display target")
+    if targets.keys() != live.keys() | disabled.keys():
+        raise ValueError("Provide exactly one target for every connected display.")
+    if not any(position.get("enabled", True) for position in positions):
+        raise ValueError("At least one display must remain enabled.")
+    guards = [monitor_guard(monitor) for monitor in live.values()]
+    rules = []
+    for position in positions:
+        fields = {"output": position["name"], "disabled": not position.get("enabled", True)}
+        if not fields["disabled"]:
+            fields.update(position=f"{position['x']}x{position['y']}",
+                          mode=f"{position['width']}x{position['height']}@{position['refreshRate']}",
+                          scale=position["scale"], transform=position["transform"])
+        encoded = ",".join(f"{key}={lua_string(value) if isinstance(value, str) else str(value).lower()}"
+                           for key, value in fields.items())
+        rules.append(f"hl.monitor({{{encoded}}}); ")
+    lua_eval("".join("do " + guard + "end; " for guard in guards) + "".join(rules))
+
+
 def workspace_may_expire(baseline, wid):
     # Hyprland may release empty, nonpersistent workspaces when they stop being
     # visible. Missing lifecycle metadata must remain a strict failure.
@@ -768,12 +897,13 @@ def workspace_may_expire(baseline, wid):
                and w.get("ispersistent") is False for w in baseline["workspaces"])
 
 
-def move_workspace(baseline, wid, target, expected_source=None, recovery=False):
-    originals = indexed(baseline["monitors"], "name", "display")
+def move_workspace(baseline, wid, target, expected_source=None, recovery=False, expected=None):
+    originals = indexed(baseline["monitors"] + baseline.get("restorableMonitors", []),
+                        "name", "display")
     may_expire = workspace_may_expire(baseline, wid)
     current = snapshot()
     if not recovery:
-        require_usable_outputs(baseline, current)
+        require_usable_outputs(expected or baseline, current)
     live = indexed(current["monitors"], "name", "display")
     workspace = indexed(current["workspaces"], "id", "workspace").get(wid)
     if target not in live or not same_identity(originals[target], live[target]):
@@ -939,28 +1069,35 @@ def finish_profile_rollback(state):
 
 def rollback(state):
     baseline, errors = state["baseline"], []
-    # Restore surviving compatible outputs together. Separate IPC evaluations
-    # expose intermediate layouts that can overlap even when both endpoints do not.
+    # Restore all compatible outputs together; topology changes are owned by
+    # the retained native connection and guarded by its before/after journal.
     try:
         current = snapshot()
         if baseline.get("session") != current.get("session"):
             return ["The compositor session changed; refusing to restore an old arrangement."]
-        live = indexed(current["monitors"], "name", "display")
-        targets = indexed(expected_outputs(baseline, state["plan"]["positions"])["monitors"], "name", "display")
-        positions = []
-        for monitor in baseline["monitors"]:
-            now = live.get(monitor["name"])
-            if now is None or not same_identity(monitor, now):
-                errors.append(f"Display {monitor['name']} disconnected or was replaced.")
-            elif not any(same_fields(expected, now, GEOMETRY + ("x", "y"))
-                         for expected in (monitor, targets[monitor["name"]])):
-                errors.append(f"Display {monitor['name']} changed externally; preserving its geometry.")
-            else:
-                positions.append({key: monitor[key] for key in POSITION})
-        if positions and state["plan"]["displayChanges"]:
-            # Guard the observed mixture of before/after states: a failed batch or
-            # restarted worker may have installed only some complete monitor rules.
-            set_positions(current, positions, force=True, recovery=True, owner=state.get("outputOwner"))
+        if state["plan"].get("enableChanges") and state.get("outputOwner"):
+            positions = [{**{key: monitor[key] for key in POSITION}, "enabled": True,
+                          "modeOptions": monitor.get("modeOptions", [])}
+                         for monitor in baseline["monitors"]]
+            positions.extend({**{key: monitor[key] for key in POSITION}, "enabled": False,
+                              "modeOptions": monitor.get("modeOptions", [])}
+                             for monitor in baseline.get("restorableMonitors", []))
+            set_positions(current, positions, force=True, recovery=True, owner=state["outputOwner"])
+        else:
+            live = indexed(current["monitors"], "name", "display")
+            targets = indexed(expected_outputs(baseline, state["plan"]["positions"])["monitors"], "name", "display")
+            positions = []
+            for monitor in baseline["monitors"]:
+                now = live.get(monitor["name"])
+                if now is None or not same_identity(monitor, now):
+                    errors.append(f"Display {monitor['name']} disconnected or was replaced.")
+                elif not any(same_fields(expected, now, GEOMETRY + ("x", "y"))
+                             for expected in (monitor, targets[monitor["name"]])):
+                    errors.append(f"Display {monitor['name']} changed externally; preserving its geometry.")
+                else:
+                    positions.append({key: monitor[key] for key in POSITION})
+            if positions and state["plan"]["displayChanges"]:
+                set_positions(current, positions, force=True, recovery=True, owner=state.get("outputOwner"))
     except Exception as error:
         errors.append(str(error))
     if state.get("profileJournal"):
@@ -1037,7 +1174,9 @@ def worker(root, token):
                         return
                     request = {"baseline": state["baseline"], "positions": state["plan"]["positions"],
                                "workspaces": state["plan"]["workspaces"],
-                               "profileWorkspaces": state["plan"].get("profileWorkspaces")}
+                               "profileWorkspaces": state["plan"].get("profileWorkspaces"),
+                               "undock": state["plan"].get("commit") == "undock",
+                               "commit": state["plan"].get("commit", "")}
                     authorization = (display_automation.worker_request(sys.modules[__name__], state)
                                      if state.get("automatic", False) else contextlib.nullcontext(request))
                     with authorization as request:
@@ -1075,17 +1214,29 @@ def worker(root, token):
                     targets.update({move["id"]: move["target"] for move in state["plan"]["workspaces"]})
                     targets.update({placement["id"]: placement["target"]
                                     for placement in state["plan"].get("profileWorkspaces") or []})
+                    intended = expected_outputs(state["baseline"], state["plan"]["positions"])
                     for wid, target in targets.items():
-                        move_workspace(state["baseline"], wid, target)
+                        move_workspace(state["baseline"], wid, target, expected=intended)
                 else:
                     for move in state["plan"]["workspaces"]:
                         move_workspace(state["baseline"], move["id"], move["target"], move["source"])
-                restore_view(state["baseline"])
+                restore_view(expected_outputs(state["baseline"], state["plan"]["positions"]))
                 if state["plan"].get("profileWorkspaces") is not None:
                     cleanup_profile(state, root)
                 settle_trial(state)
                 with locked(root):
                     latest = load(root, token)
+                    if state["plan"].get("commit"):
+                        verify_trial(state)
+                        if state.get("outputOwner"):
+                            output_owner.finish(root, state["outputOwner"], keep=True)
+                        action = state["plan"]["commit"]
+                        state.update(request=latest.get("request", ""), state="kept", phase="finished",
+                                     message=("Undocked safely for this session."
+                                              if action == "undock"
+                                              else "All session-disabled displays re-enabled."))
+                        save(root, state)
+                        return
                     state.update(request=latest.get("request", ""), state="pending", phase="waiting",
                                  deadline=time.monotonic() + CONFIRM_SECONDS,
                                  message=(f"Restoring {state['profileName']} automatically. Verifying for 20 seconds, then keeping for this session. Open the arrangement panel to Revert."
