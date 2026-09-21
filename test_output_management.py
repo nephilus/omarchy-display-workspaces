@@ -371,8 +371,6 @@ class OutputPeer:
         if outcome == "silent":
             return
         for head_id, (head, settings) in configuration.items():
-            if head["disabled"] != settings["disabled"]:
-                head["policy"] = {"icc": None, "hdr": False, "vrr": 0}
             mode = self.mode_overrides.get(head_id, self.server.fallback_modes[head["name"]])
             settings = {**mode, **settings}
             settings.pop("_mode", None)
@@ -423,6 +421,33 @@ class OutputManagementTests(unittest.TestCase):
                 self.assertEqual(server.heads[0]["policy"], policy)
             self.assertTrue(server.disconnected.wait(2))
             self.assertEqual(server.overrides, set())
+
+    def test_disable_and_reenable_preserve_policy_and_saved_geometry(self):
+        with OutputServer(absolute_display=True) as server:
+            server.heads[0]["modeOptions"].append(copy.deepcopy(server.heads[0]["modeOptions"][0]))
+            baseline = server.expected()
+            original = copy.deepcopy(server.heads[0])
+            targets = [{**position, "enabled": True, "modeOptions": baseline["monitors"][index]["modeOptions"]}
+                       for index, position in enumerate(self.positions(baseline))]
+            targets[0]["enabled"] = False
+            targets.append({"name": "DP-9", "enabled": False})
+            with Connection(timeout=2) as connection:
+                connection.plan(baseline, targets)
+                connection.apply(baseline, targets)
+                disabled = server.expected()
+                self.assertEqual({m["name"] for m in disabled["disabledMonitors"]}, {"DP-7", "DP-9"})
+                self.assertEqual(server.heads[0]["policy"], original["policy"])
+                restored = [{**{key: original[key] for key in POSITION}, "enabled": True,
+                             "modeOptions": original["modeOptions"]}]
+                restored.extend({**{key: m[key] for key in POSITION}, "enabled": True,
+                                 "modeOptions": m["modeOptions"]}
+                                for m in disabled["monitors"])
+                restored.append({"name": "DP-9", "enabled": False})
+                connection.apply(disabled, restored)
+            self.assertFalse(server.heads[0]["disabled"])
+            self.assertEqual({key: server.heads[0][key] for key in POSITION},
+                             {key: original[key] for key in POSITION})
+            self.assertEqual(server.heads[0]["policy"], original["policy"])
 
     def test_disconnect_releases_override_without_reverting_kept_geometry(self):
         with OutputServer() as server:

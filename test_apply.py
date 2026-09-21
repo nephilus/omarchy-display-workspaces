@@ -114,6 +114,36 @@ class LayoutSafetyTests(unittest.TestCase):
         self.assertEqual(errors, [])
         self.assertEqual(self.current, before)
 
+    def test_workspace_reconciliation_accepts_intended_disabled_topology(self):
+        baseline = self.discover([{"id": 1, "monitor": "A"}, {"id": 2, "monitor": "B"}])
+        positions = [{**{key: monitor[key] for key in arrangement.POSITION},
+                      "enabled": monitor["name"] == "A"}
+                     for monitor in baseline["monitors"]]
+        self.current = arrangement.expected_outputs(baseline, positions)
+        self.current["workspaces"] = [{"id": 1, "monitor": "A"}, {"id": 2, "monitor": "A"}]
+        with self.compositor():
+            arrangement.move_workspace(baseline, 2, "A", expected=self.current)
+
+    def test_lua_topology_rule_disables_connected_output(self):
+        positions = [{**{key: monitor[key] for key in arrangement.POSITION},
+                      "enabled": monitor["name"] == "A"}
+                     for monitor in self.current["monitors"]]
+
+        def evaluate(code):
+            for spec in re.findall(r"hl\.monitor\(\{([^}]+)\}\)", code):
+                fields = dict(re.findall(r'(\w+)=("[^"]*"|true|false|[^,]+)', spec))
+                name = json.loads(fields["output"])
+                if fields["disabled"] == "true":
+                    monitor = next(m for m in self.current["monitors"] if m["name"] == name)
+                    self.current["monitors"].remove(monitor)
+                    self.current["disabledMonitors"].append(
+                        {key: monitor.get(key) for key in arrangement.IDENTITY} | {"disabled": True})
+
+        with patch.object(arrangement, "lua_eval", side_effect=evaluate):
+            arrangement.apply_topology(copy.deepcopy(self.current), positions)
+        self.assertEqual([m["name"] for m in self.current["monitors"]], ["A"])
+        self.assertEqual([m["name"] for m in self.current["disabledMonitors"]], ["B"])
+
     def test_faulty_output_preserves_healthy_outputs_and_all_workspaces(self):
         self.raw[1]["width"] = 0
         self.raw.extend([{"name": "off", "disabled": True, "width": 0},
@@ -246,6 +276,75 @@ class LayoutSafetyTests(unittest.TestCase):
         self.plan["positions"][2]["x"] = 1999
         with self.assertRaises(ValueError):
             self.validate()
+
+    def test_disable_requires_workspace_evacuation_and_keeps_one_display(self):
+        baseline = self.discover([{"id": 1, "monitor": "A"}, {"id": 2, "monitor": "B"}])
+        positions = [{**{key: monitor[key] for key in arrangement.POSITION}, "enabled": True,
+                      "modeOptions": monitor["modeOptions"]}
+                     for monitor in baseline["monitors"]]
+        positions[1]["enabled"] = False
+        request = {"baseline": baseline, "positions": positions, "workspaces": []}
+        with self.assertRaisesRegex(ValueError, "Move every workspace.*2"):
+            arrangement.validate(request, baseline)
+        request["workspaces"] = [{"id": 2, "source": "B", "target": "A"}]
+        result = arrangement.validate(request, baseline)
+        self.assertEqual(result["enableChanges"], 1)
+        self.assertEqual(result["displayChanges"], 1)
+        positions[0]["enabled"] = False
+        with self.assertRaisesRegex(ValueError, "at least one"):
+            arrangement.validate(request, baseline)
+
+    def test_safe_undock_leaves_only_internal_display(self):
+        self.raw[0]["name"] = "eDP-1"
+        self.raw[1]["name"] = "DP-1"
+        baseline = self.discover([{"id": 1, "monitor": "eDP-1"}, {"id": 2, "monitor": "DP-1"}])
+        positions = [{**{key: monitor[key] for key in arrangement.POSITION}, "enabled": True,
+                      "modeOptions": monitor["modeOptions"]}
+                     for monitor in baseline["monitors"]]
+        positions[1]["enabled"] = False
+        request = {"baseline": baseline, "positions": positions, "undock": True, "commit": "undock",
+                   "workspaces": [{"id": 2, "source": "DP-1", "target": "eDP-1"}]}
+        result = arrangement.validate(request, baseline)
+        self.assertEqual(result["enableChanges"], 1)
+        self.assertEqual(result["commit"], "undock")
+        positions[0]["enabled"], positions[1]["enabled"] = False, True
+        with self.assertRaisesRegex(ValueError, "internal"):
+            arrangement.validate(request, baseline)
+
+    def test_redock_immediately_enables_every_owner_disabled_display(self):
+        original = self.discover([{"id": 1, "monitor": "A"}, {"id": 2, "monitor": "B"}])
+        disabled = arrangement.expected_outputs(original, [
+            {**{key: monitor[key] for key in arrangement.POSITION},
+             "enabled": monitor["name"] == "A", "modeOptions": monitor["modeOptions"]}
+            for monitor in original["monitors"]])
+        disabled["redockMonitors"] = copy.deepcopy(original["monitors"])
+        disabled["workspaces"] = [{"id": 1, "monitor": "A"}, {"id": 2, "monitor": "A"}]
+        disabled["redockWorkspaces"] = copy.deepcopy(original["workspaces"])
+        disabled["restorableMonitors"] = [copy.deepcopy(original["monitors"][1])]
+        positions = [{**{key: monitor[key] for key in arrangement.POSITION},
+                      "enabled": True, "modeOptions": monitor["modeOptions"]}
+                     for monitor in disabled["monitors"] + disabled["restorableMonitors"]]
+        result = arrangement.validate({"baseline": disabled, "positions": positions,
+                                       "workspaces": [{"id": 2, "source": "A", "target": "B"}],
+                                       "commit": "redock"}, disabled)
+        self.assertEqual(result["enableChanges"], 1)
+        self.assertEqual(result["commit"], "redock")
+
+        with self.assertRaisesRegex(ValueError, "restore workspace"):
+            arrangement.validate({"baseline": disabled, "positions": positions,
+                                  "workspaces": [], "commit": "redock"}, disabled)
+
+
+    def test_redock_can_move_workspace_to_newly_reenabled_display(self):
+        baseline = self.discover([{"id": 2, "monitor": "A"}])
+        saved_b = copy.deepcopy(baseline["monitors"][1])
+        baseline["monitors"] = baseline["monitors"][:1]
+        baseline["restorableMonitors"] = [{**saved_b, "disabled": True}]
+        self.current = copy.deepcopy(baseline)
+        self.current["monitors"] = [copy.deepcopy(baseline["monitors"][0]), saved_b]
+        self.current["disabledMonitors"] = []
+        with self.compositor():
+            arrangement.move_workspace(baseline, 2, "B", expected=self.current)
 
     def test_one_pixel_overlap_is_rejected(self):
         self.plan["positions"][1]["x"] = 1279
@@ -423,6 +522,50 @@ class LayoutSafetyTests(unittest.TestCase):
             finished = arrangement.load(root, token)
         self.assertEqual(finished["state"], "failed")
         self.assertEqual(self.current["monitors"], self.plan["baseline"]["monitors"])
+
+    def test_confirmed_topology_action_keeps_immediately_after_verification(self):
+        plan = dict(self.plan, displayChanges=1, enableChanges=1, profileWorkspaces=None,
+                    commit="undock")
+        token = "f" * 48
+        state = {"token": token, "state": "starting", "phase": "prepared", "request": "",
+                 "message": "Starting", "mutationStarted": False,
+                 "baseline": self.plan["baseline"], "plan": plan}
+        with tempfile.TemporaryDirectory() as directory, \
+                patch.object(arrangement, "validate", return_value=plan), \
+                patch.object(arrangement, "set_positions"), \
+                patch.object(arrangement, "move_workspace"), \
+                patch.object(arrangement, "restore_view"), \
+                patch.object(arrangement, "settle_trial"), \
+                patch.object(arrangement, "verify_trial") as verify:
+            root = Path(directory)
+            arrangement.save(root, state)
+            arrangement.worker(root, token)
+            finished = arrangement.load(root, token)
+        self.assertEqual(finished["state"], "kept", finished["message"])
+        self.assertEqual(finished["message"], "Undocked safely for this session.")
+        verify.assert_called_once()
+
+    def test_failed_confirmed_topology_action_rolls_back(self):
+        plan = dict(self.plan, displayChanges=1, enableChanges=1, profileWorkspaces=None,
+                    commit="redock")
+        token = "1" * 48
+        state = {"token": token, "state": "starting", "phase": "prepared", "request": "",
+                 "message": "Starting", "mutationStarted": False,
+                 "baseline": self.plan["baseline"], "plan": plan}
+        with tempfile.TemporaryDirectory() as directory, \
+                patch.object(arrangement, "validate", return_value=plan), \
+                patch.object(arrangement, "set_positions"), \
+                patch.object(arrangement, "move_workspace"), \
+                patch.object(arrangement, "restore_view"), \
+                patch.object(arrangement, "settle_trial"), \
+                patch.object(arrangement, "verify_trial", side_effect=ValueError("Synthetic verification failure")), \
+                patch.object(arrangement, "rollback", return_value=[]) as rollback:
+            root = Path(directory)
+            arrangement.save(root, state)
+            arrangement.worker(root, token)
+            finished = arrangement.load(root, token)
+        self.assertEqual(finished["state"], "failed")
+        rollback.assert_called_once()
 
     def test_restarted_worker_restores_own_mode_changes_without_resuming_trial(self):
         plan = self.mode_plan()

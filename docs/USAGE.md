@@ -14,7 +14,7 @@ Name and icon changes update the existing workspace controls in place, preservin
 
 A unique hardware identity is preferred when matching saved settings after a connector changes. Connector names are the fallback. Disconnected displays retain their saved settings until explicitly forgotten.
 
-**Detect displays** refreshes discovery without clearing saved names, icons, or ordering. Hotplug events also refresh the models.
+Display and workspace hotplug events refresh discovery automatically. One top-right dock-transition button reflects current state: **Undock safely…** when external outputs are active, or **Redock safely…** when this session owns disabled outputs.
 
 ## Session layout and workspace moves
 
@@ -41,6 +41,25 @@ Hyprland can create temporary replacement workspaces when an active workspace mo
 
 When an output reports zero size or other invalid geometry, healthy displays and workspace cards remain visible. Names/icons/order and the configuration catalog remain accessible; unsafe layout actions stay blocked. This protects against bad geometry but does not fix the underlying driver, cable, or compositor problem.
 
+### Temporarily disabling displays and undocking safely
+
+In **Displays**, select an output and choose **Disable**. This edits only the draft. The plugin automatically stages every positive workspace currently targeting that output onto a remaining enabled display; review those moves in Workspaces, then use **Preview (20s) → Apply**. At least one output must remain enabled. Revert or expiry restores the prior enabled topology and workspace placement where the hardware remains available.
+
+After Apply, an output disabled by this session owner remains listed in the Display selector with **Enable**. Its complete prior geometry and mode catalog are held only in the private runtime journal, allowing a later guarded Preview to re-enable it. Displays already disabled by another tool or configuration are not guessed and cannot be enabled here.
+
+Disabling an output can cause Hyprland to relocate its windows. The plugin manages workspace placement, not individual windows; re-enabling does not promise to return each window to its former screen. Enable-state changes use guarded runtime `hl.monitor` rules, are session-only, do not write `monitors.lua`, and cannot be combined with a loaded profile draft or automatic restoration. Geometry-only changes on new connectors continue to use native output management.
+
+Use **Undock safely… → Confirm undock** while the laptop and dock are still awake. Confirmation is the final action; there is no second Preview/Apply step. The independent worker still preflights the full topology, journals rollback before mutation, verifies the result, and restores the previous arrangement if application or verification fails. A successful action:
+
+1. Requires a healthy enabled internal output named `eDP-*`.
+2. Leaves only internal outputs enabled.
+3. Moves workspaces from every enabled external output to the internal display.
+4. Keeps the session-only topology immediately after verification.
+
+After success and while the laptop display remains healthy, physically disconnect the dock, wait for removal to register, and then suspend. The action does not suspend, power off the dock, reset USB4/DisplayPort MST, or guarantee recovery from a failed hardware link. It prevents the compositor from retaining external desktop space during deliberate undocking; it is not a kernel repair.
+
+While those disabled outputs remain physically connected and owned by the same compositor session, the same top-right control becomes **Redock safely… → Confirm redock**. It restores the complete pre-undock display geometry and workspace placement from the guarded runtime journal. Redock confirmation is final and uses the same preflight, verification, and failure rollback. Outputs disabled by another tool are never guessed. Manual Redock intentionally suppresses automatic-profile replay for that connection episode; it does not need automation because it restores the journaled workspace placement itself.
+
 ### New connectors and session ownership
 
 Moving a display to a new HDMI/DP/USB-C connector no longer requires adding an exact rule for that connector before manual arrangement. With a supported monitor configuration, use the same Displays/Workspaces → Preview → Apply flow. The new path uses Hyprland's native output-management protocol to override geometry without replacing hidden ICC/HDR/VRR policy or writing `monitors.lua`. Existing exact-rule arrangements retain their original backend unless a session owner is already active.
@@ -49,7 +68,7 @@ Hardware matching and applying geometry are separate steps. An existing profile 
 
 To restore after a port change:
 
-1. Connect the display and choose **Detect displays** if discovery has not refreshed.
+1. Connect the display and wait for hotplug discovery; close and reopen the panel if the shell has not refreshed.
 2. In **Profiles**, select the existing profile and check compatibility. All enabled displays must match; a unique strong identity can match across connector names.
 3. Choose **Review layout**, inspect the draft without a time limit, then **Preview (20s) → Apply**.
 4. Save/update a profile only if you want to record a different arrangement. A connector-name change alone does not require a new profile when strong matching succeeds.
@@ -97,7 +116,7 @@ The profile defines the positive workspace IDs to restore, not just moves for ID
 - Cleanup checks emptiness again inside the compositor immediately before changing persistence or visibility. A workspace that gains a window is not removed.
 - Each enabled display must retain at least one saved workspace or a populated/unknown-count extra. Otherwise Preview refuses the draft instead of inventing a workspace or moving windows.
 
-Loading and editing cards still affect only the draft. **Detect displays** retains loaded profile targets for review and fresh validation. Cancel, expiry, or interrupted-worker recovery removes the preview's session pins and restores the original placements and retired empty workspaces where possible; ordinary empty nonpersistent workspaces can still expire when no longer visible.
+Loading and editing cards still affect only the draft. Hotplug events refresh discovery automatically while retaining loaded profile targets for review and fresh validation. Cancel, expiry, or interrupted-worker recovery removes the preview's session pins and restores the original placements and retired empty workspaces where possible; ordinary empty nonpersistent workspaces can still expire when no longer visible.
 
 Retention and cleanup use runtime-only workspace rules. No configuration files are rewritten. Existing exact rules retain their unrelated fields; only their persistence is changed where necessary. Broad or named persistent rules block profile Preview when their effects cannot be isolated safely. Apply leaves the session rules active; configuration reload or a new compositor session can replace them. A reload or external rule change during Preview invalidates the trial; recovery preserves external edits and reports incomplete restoration rather than recreating old rules blindly.
 
@@ -110,7 +129,7 @@ Retention and cleanup use runtime-only workspace rules. No configuration files a
 - Stored rotations are restored through the same preview transaction; there is no rotation editor. Loading normalizes the common origin without changing relative positions.
 - A hardware match does not bypass safety preflight. Manual Preview can use native session ownership when a connector has no exact rule; automatic display changes still require supported exact connector rules in the loaded `hypr.monitors` module.
 
-Unavailable profiles stay listed with a reason and can be deleted or have automation disabled without matching that display combination. Use **Detect displays** after an external display or configuration change.
+Unavailable profiles stay listed with a reason and can be deleted or have automation disabled without matching that display combination. Close and reopen the panel after an external display or configuration change if automatic refresh has not completed.
 
 ## Optional automatic restoration
 
@@ -144,7 +163,7 @@ Profiles live in `$XDG_CONFIG_HOME/display-workspaces/profiles.json`, defaulting
 
 Changes to an existing store first back up its exact bytes beside it as `profiles.json.profile-<random-token>.bak`, then atomically replace the store. **Profiles → Details** reports the last profile operation's backup paths. Ownership, permissions, symlinks, schema version, and revision are checked; malformed or newer-version files are refused rather than overwritten. Profile operations use a separate store lock across compositor sessions. Do not manually edit the store while an operation is running: guards detect observed external edits, but arbitrary editors do not participate in the lock. Automatic authorization is rechecked before mutation and before unattended keep.
 
-For manual recovery, close the panel, preserve the current file, and compare a backup before restoring or merging it. Restoring the whole file can erase profiles saved later. Reopen the panel or use Detect displays afterward. No Hyprland reload is needed. Profile backups are not automatically pruned. Forget and uninstall do not remove profiles or their backups.
+For manual recovery, close the panel, preserve the current file, and compare a backup before restoring or merging it. Restoring the whole file can erase profiles saved later. Reopen the panel afterward. No Hyprland reload is needed. Profile backups are not automatically pruned. Forget and uninstall do not remove profiles or their backups.
 
 Version 2.4 reads version-1 profile stores without writing them and treats every old profile as manual. The next confirmed store change writes schema version 2 with explicit automation flags, preserving the old file in an exact backup. Plugin versions through 2.3 cannot read schema 2. Before downgrading, preserve the current store and review an appropriate old-format backup; restoring it can lose profiles or changes made later.
 

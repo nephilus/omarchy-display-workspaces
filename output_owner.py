@@ -32,6 +32,49 @@ def active(api, root):
     state = load(api, root)
     return state is not None and not state.get("stopped", False)
 
+def restoration(api, root, current):
+    state = load(api, root)
+    if not state or state.get("stopped") or not state.get("before") or not state.get("after"):
+        return None
+    try:
+        if state.get("config") != config_stamp(api) or current.get("session") != state["before"].get("session"):
+            return None
+    except (OSError, ValueError):
+        return None
+    source = state.get("restore") or state["before"]
+    connected = {m["name"]: m for m in current["monitors"] + current.get("disabledMonitors", [])}
+    saved = {m["name"]: m for m in source.get("monitors", [])}
+    if (not saved or not saved.keys() <= connected.keys()
+            or any(not api.same_fields(monitor, connected[name], api.IDENTITY)
+                   for name, monitor in saved.items())
+            or not any(name in {m["name"] for m in current.get("disabledMonitors", [])}
+                       for name in saved)):
+        return None
+    return source
+
+
+def restorable(api, root, current):
+    """Return complete geometry only for outputs disabled by the live owner."""
+    source = restoration(api, root, current)
+    if source is None:
+        return []
+    disabled = {m["name"] for m in current.get("disabledMonitors", [])}
+    return [{**monitor, "disabled": True} for monitor in source["monitors"]
+            if monitor["name"] in disabled]
+
+
+def redock_layout(api, root, current):
+    """Return the owner's complete pre-disable geometry for all connected outputs."""
+    source = restoration(api, root, current)
+    return [dict(monitor) for monitor in source["monitors"]] if source is not None else []
+
+
+def redock_workspaces(api, root, current):
+    """Return the pre-disable workspace placement retained by the live owner."""
+    source = restoration(api, root, current)
+    return [dict(workspace) for workspace in source.get("workspaces", [])
+            if workspace.get("id", 0) > 0] if source is not None else []
+
 
 def receive(stream):
     data = bytearray()
@@ -75,10 +118,13 @@ def scale_checks(api):
 
 def preflight(api, current, positions):
     checks = scale_checks(api)
+    rollback = [{**{key: m[key] for key in api.POSITION}, "enabled": True,
+                 "modeOptions": m.get("modeOptions", [])} for m in current["monitors"]]
+    rollback.extend({**{key: m[key] for key in api.POSITION}, "enabled": False,
+                     "modeOptions": m.get("modeOptions", [])}
+                    for m in current.get("restorableMonitors", []))
     with output_management.Connection() as connection:
-        # A draft must have a representable recovery baseline as well as target.
-        connection.plan(current, [{key: m[key] for key in api.POSITION}
-                                  for m in current["monitors"]], scale_checks=checks)
+        connection.plan(current, rollback, scale_checks=checks)
         connection.plan(current, positions, scale_checks=checks)
 
 
@@ -148,20 +194,32 @@ def config_stamp(api):
 
 
 def geometry_matches(api, expected, current, alternative=None):
-    before = {m["name"]: m for m in expected["monitors"]}
-    after = {m["name"]: m for m in current["monitors"]}
-    alternatives = {m["name"]: m for m in (alternative or expected)["monitors"]}
-    disabled_before = {m["name"]: m for m in expected.get("disabledMonitors", [])}
-    disabled_after = {m["name"]: m for m in current.get("disabledMonitors", [])}
-    return (before.keys() == after.keys() == alternatives.keys()
-            and disabled_before.keys() == disabled_after.keys()
-            and all(api.same_fields(m, disabled_after[name], api.IDENTITY)
-                    for name, m in disabled_before.items())
-            and not current.get("unavailableMonitors") and not current.get("mirroredOutputs")
-            and expected.get("session") == current.get("session")
-            and all(any(api.same_fields(candidate, after[name], api.IDENTITY + api.GEOMETRY + ("x", "y"))
-                        for candidate in (m, alternatives[name]))
-                    for name, m in before.items()))
+    alternatives = alternative or expected
+    expected_enabled = {m["name"]: m for m in expected["monitors"]}
+    alternative_enabled = {m["name"]: m for m in alternatives["monitors"]}
+    expected_disabled = {m["name"]: m for m in expected.get("disabledMonitors", [])}
+    alternative_disabled = {m["name"]: m for m in alternatives.get("disabledMonitors", [])}
+    current_enabled = {m["name"]: m for m in current["monitors"]}
+    current_disabled = {m["name"]: m for m in current.get("disabledMonitors", [])}
+    connected = set(expected_enabled) | set(expected_disabled)
+    if (connected != set(alternative_enabled) | set(alternative_disabled)
+            or connected != set(current_enabled) | set(current_disabled)
+            or current.get("unavailableMonitors") or current.get("mirroredOutputs")
+            or expected.get("session") != current.get("session")):
+        return False
+    for name in connected:
+        if name in current_enabled:
+            candidates = [state[name] for state in (expected_enabled, alternative_enabled) if name in state]
+            if not any(api.same_fields(candidate, current_enabled[name],
+                                       api.IDENTITY + api.GEOMETRY + ("x", "y"))
+                       for candidate in candidates):
+                return False
+        else:
+            candidates = [state[name] for state in (expected_disabled, alternative_disabled) if name in state]
+            if not any(api.same_fields(candidate, current_disabled[name], api.IDENTITY)
+                       for candidate in candidates):
+                return False
+    return True
 
 
 def serve(api, root):
@@ -171,7 +229,7 @@ def serve(api, root):
         stamp = config_stamp(api)
         state = previous if previous and not previous.get("stopped") else {
             "version": 1, "generation": api.secrets.token_hex(24), "stopped": False,
-            "before": None, "after": None, "config": stamp}
+            "before": None, "after": None, "restore": None, "config": stamp}
         connection = resources.enter_context(output_management.Connection())
         events = resources.enter_context(socket.socket(socket.AF_UNIX, socket.SOCK_STREAM))
         events.settimeout(4)
@@ -186,8 +244,16 @@ def serve(api, root):
             if state["config"] != stamp or not geometry_matches(api, before, current, after):
                 reason = "Displays or configuration changed while the layout owner was unavailable."
             else:
-                positions = [{key: m[key] for key in api.POSITION} for m in current["monitors"]]
-                connection.apply(current, positions, scale_checks=scale_checks(api))
+                positions = [{**{key: m[key] for key in api.POSITION}, "enabled": True,
+                              "modeOptions": m.get("modeOptions", [])}
+                             for m in current["monitors"]]
+                positions.extend({**{key: m[key] for key in api.POSITION}, "enabled": False,
+                                  "modeOptions": m.get("modeOptions", [])}
+                                 for m in current.get("restorableMonitors", []))
+                topology_owned = ({m["name"] for m in before["monitors"]}
+                                  != {m["name"] for m in after["monitors"]})
+                if not topology_owned:
+                    connection.apply(current, positions, scale_checks=scale_checks(api))
                 state.update(before=current, after=current)
         if reason:
             state.update(stopped=True, reason=reason)
@@ -223,11 +289,16 @@ def serve(api, root):
                         raise ValueError("Compositor event frame is too large.")
                     lines = pending_events.split(b"\n")
                     pending_events = lines.pop()
-                    if any(line.partition(b">>")[0] in {
-                            b"configreloaded", b"monitoradded", b"monitoraddedv2", b"monitorremoved"}
-                           for line in lines):
+                    kinds = {line.partition(b">>")[0] for line in lines}
+                    if b"configreloaded" in kinds:
                         reason = "Display configuration or connections changed; layout ownership released."
                         break
+                    if kinds & {b"monitoradded", b"monitoraddedv2", b"monitorremoved"}:
+                        current = api.snapshot()
+                        if not state.get("after") or not geometry_matches(api, state["after"], current,
+                                                                        state["before"]):
+                            reason = "Display configuration or connections changed; layout ownership released."
+                            break
                 elif key.data == 1:
                     connection.dispatch()
                     if state.get("after") and not geometry_matches(api, state["after"], api.snapshot(), state["before"]):
@@ -269,18 +340,38 @@ def serve(api, root):
                                     raise ValueError(reason)
                                 expected, positions = request["expected"], request["positions"]
                                 current = api.snapshot()
-                                api.compare_outputs(expected, current, catalog=True)
-                                selected = api.indexed(positions, "name", "display position")
-                                if not selected.keys() <= {m["name"] for m in current["monitors"]}:
+                                if not geometry_matches(api, expected, current):
+                                    raise ValueError("Displays changed before session layout mutation.")
+                                selected = api.indexed(positions, "name", "display target")
+                                connected = ({m["name"] for m in current["monitors"]}
+                                             | {m["name"] for m in current.get("disabledMonitors", [])})
+                                if not selected.keys() <= connected:
                                     raise ValueError("A requested display is no longer connected.")
-                                # Pin untouched live geometry too, without restoring a foreign edit.
-                                complete = [selected.get(m["name"], {k: m[k] for k in api.POSITION})
-                                            for m in current["monitors"]]
+                                complete = list(positions)
+                                complete.extend({"name": m["name"], "enabled": False}
+                                                for m in current.get("disabledMonitors", [])
+                                                if m["name"] not in selected)
                                 checks = scale_checks(api)
-                                connection.plan(current, complete, scale_checks=checks)
-                                state.update(before=current, after=api.expected_outputs(current, complete))
+                                after = api.expected_outputs(current, complete)
+                                topology_change = ({m["name"] for m in current["monitors"]}
+                                                   != {m["name"] for m in after["monitors"]})
+                                if topology_change:
+                                    with output_management.Connection() as probe:
+                                        probe.plan(current, complete, scale_checks=checks)
+                                else:
+                                    connection.plan(current, complete, scale_checks=checks)
+                                restore = state.get("restore")
+                                if topology_change and restore is None:
+                                    restore = current
+                                if restore and not ({m["name"] for m in restore["monitors"]}
+                                                    & {m["name"] for m in after.get("disabledMonitors", [])}):
+                                    restore = None
+                                state.update(before=current, after=after, restore=restore)
                                 api.atomic(root, STATE, state)
-                                connection.apply(current, complete, scale_checks=checks)
+                                if topology_change:
+                                    api.apply_topology(current, complete)
+                                else:
+                                    connection.apply(current, complete, scale_checks=checks)
                                 result = {"ok": True}
                             else:
                                 raise ValueError("Unknown session layout operation.")
