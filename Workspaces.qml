@@ -22,7 +22,7 @@ BarWidget {
   readonly property bool cursorQueryRunning: cursorQuery.running
   readonly property string cursorDisplayName: cursorKnown ? displayAt(cursorPosition.x, cursorPosition.y) : ""
 
-  readonly property bool automationBlocked: arranger.opened
+  readonly property bool automationBlocked: arranger.opened || resumeSettling || resumeFailed
   readonly property bool autoQueryRunning: automaticQuery.running || completingAutomatic
   property bool autoEventPending: false
   property bool autoBlockPending: false
@@ -31,6 +31,13 @@ BarWidget {
   property string autoStatus: "idle"
   property string autoMessage: ""
   property var autoResult: null
+  property bool resumeSettling: false
+  property bool resumeFailed: false
+  property bool resumeBackendReady: false
+  property int resumeSettleTicks: 0
+  property int resumeSettleAttempts: 0
+  property string resumeSettleSignature: ""
+  property double heartbeatAt: 0
 
   onAutomationBlockedChanged: if (automationBlocked) requestAutomationCheck(false, true)
 
@@ -45,6 +52,8 @@ BarWidget {
       topologyRefresh.stop()
       workspaceFocusRefresh.stop()
       automaticTimer.stop()
+      resumeSettleTimer.stop()
+      resumeRefresh.running = false
       handoffAutomation(cursorTracker)
     }
   }
@@ -53,6 +62,8 @@ BarWidget {
     topologyRefresh.stop()
     workspaceFocusRefresh.stop()
     automaticTimer.stop()
+    resumeSettleTimer.stop()
+    resumeRefresh.running = false
     if (automaticQuery.running) {
       autoEventPending = autoEventPending || automaticQuery.sentEvent
       autoBlockPending = autoBlockPending || automaticQuery.sentBlocked
@@ -86,6 +97,7 @@ BarWidget {
       var hotplug = event.name === "monitoradded" || event.name === "monitoraddedv2"
         || event.name === "monitorremoved" || event.name === "monitorremovedv2"
       if (hotplug || event.name === "configreloaded") topologyRefresh.restart()
+      if (hotplug && root.resumeFailed) root.beginResumeRefresh()
       if (hotplug) root.requestAutomationCheck(true, false)
     }
   }
@@ -108,6 +120,105 @@ BarWidget {
     interval: 40
     onTriggered: {
       if (root.cursorTracker === root) Hyprland.refreshMonitors()
+    }
+  }
+  function resumeHealthSignature() {
+    var monitors = Hyprland.monitors.values
+    if (!monitors.length) return ""
+    var states = []
+    for (var i = 0; i < monitors.length; ++i) {
+      var monitor = monitors[i], state = monitor && monitor.lastIpcObject
+      if (!state || state.disabled || state.mirrorOf) continue
+      if (!finiteNumber(state.width) || state.width < 1 || state.width > 65536
+          || !finiteNumber(state.height) || state.height < 1 || state.height > 65536
+          || !finiteNumber(state.scale) || state.scale < 0.1 || state.scale > 16
+          || !finiteNumber(state.transform) || state.transform < 0 || state.transform > 7
+          || Math.floor(state.transform) !== state.transform
+          || !finiteNumber(state.x) || !finiteNumber(state.y)) return ""
+      states.push([monitor.name, state.width, state.height, state.scale, state.transform, state.x, state.y])
+    }
+    return states.length ? JSON.stringify(states.sort(function(a, b) { return a[0].localeCompare(b[0]) })) : ""
+  }
+  function beginResumeRefresh() {
+    if (cursorTracker !== root || resumeRefresh.running || resumeSettling) return
+    resumeSettling = true
+    resumeFailed = false
+    resumeBackendReady = false
+    autoStatus = "blocked"
+    autoMessage = "Refreshing displays after resume…"
+    resumeSettleTicks = 0
+    resumeSettleAttempts = 0
+    resumeSettleSignature = ""
+    resumeRefresh.command = ["python3", Qt.resolvedUrl("apply.py").toString().replace("file://", ""), "resume-refresh"]
+    resumeRefresh.running = true
+  }
+  function checkResumeSettlement() {
+    if (cursorTracker !== root || !resumeSettling) {
+      resumeSettleTimer.stop()
+      return
+    }
+    Hyprland.refreshMonitors()
+    Hyprland.refreshWorkspaces()
+    var signature = resumeHealthSignature()
+    resumeSettleAttempts++
+    if (!resumeBackendReady && resumeSettleAttempts % 4 === 0 && !resumeRefresh.running)
+      resumeRefresh.running = true
+    if (resumeBackendReady && signature !== "" && signature === resumeSettleSignature) resumeSettleTicks++
+    else resumeSettleTicks = resumeBackendReady && signature !== "" ? 1 : 0
+    resumeSettleSignature = signature
+    if (resumeBackendReady && resumeSettleTicks >= 4) {
+      resumeSettling = false
+      resumeFailed = false
+      autoStatus = "idle"
+      autoMessage = ""
+      resumeSettleTimer.stop()
+    } else if (resumeSettleAttempts >= 20) {
+      resumeSettling = false
+      resumeFailed = true
+      autoStatus = "failed"
+      autoMessage = "Displays did not settle safely after resume. Layout automation remains blocked until a monitor connection changes."
+      resumeSettleTimer.stop()
+    }
+  }
+  Timer {
+    id: heartbeat
+    interval: 1000
+    repeat: true
+    triggeredOnStart: true
+    running: root.cursorTracker === root
+    onTriggered: {
+      var now = Date.now()
+      if (root.heartbeatAt > 0 && now - root.heartbeatAt > 15000) root.beginResumeRefresh()
+      root.heartbeatAt = now
+    }
+    onRunningChanged: if (!running) root.heartbeatAt = 0
+  }
+  Timer {
+    id: resumeSettleTimer
+    interval: 500
+    repeat: true
+    onTriggered: root.checkResumeSettlement()
+  }
+  Process {
+    id: resumeRefresh
+    objectName: "resume-refresh-process"
+    stdout: StdioCollector { id: resumeOutput; waitForEnd: true }
+    stderr: StdioCollector { waitForEnd: true }
+    onExited: function(code, status) {
+      if (root.cursorTracker !== root) return
+      var result = null
+      try { result = JSON.parse(resumeOutput.text) } catch (error) {}
+      Hyprland.refreshMonitors()
+      Hyprland.refreshWorkspaces()
+      if (code !== 0 || status !== 0 || !result) {
+        root.resumeSettling = false
+        root.resumeFailed = true
+        root.autoStatus = "failed"
+        root.autoMessage = "Could not refresh displays safely after resume. Layout automation remains blocked until a monitor connection changes."
+        return
+      }
+      root.resumeBackendReady = result.ok === true
+      resumeSettleTimer.restart()
     }
   }
 

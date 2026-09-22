@@ -2,9 +2,9 @@
   "schemaVersion": 1,
   "id": "display.workspaces",
   "name": "Omarchy Display Workspaces",
-  "version": "2.6.0",
+  "version": "2.7.0",
   "author": "nephilus (based on Omarchy)",
-  "description": "Per-display workspaces, guarded session layouts, safe undock/redock, and optional automatic profiles",
+  "description": "Per-display workspaces, guarded session layouts, and optional automatic profiles",
   "kinds": [
     "bar-widget"
   ],
@@ -13,7 +13,7 @@
   },
   "barWidget": {
     "displayName": "Display Workspaces",
-    "description": "The green display highlight follows the cursor. Right-click for compact Displays, Workspaces, and Profiles tabs. Arrange advertised modes, scale, placement, and workspace assignments through a guarded 20-second Preview. Confirmed Undock safely immediately leaves the internal panel enabled, moves external workspaces, and disables external outputs; confirmed Redock safely re-enables every display disabled by this session. Manual new-connector changes use native output management without writing monitor rules. Apply is session-only. Profiles capture confirmed live arrangements; optional automatic restoration requires explicit consent and supported exact rules. Names, icons and order save separately. Forget performs confirmed configuration cleanup with exact backups.",
+    "description": "The green display highlight follows the cursor. Right-click for compact Displays, Workspaces, and Profiles tabs. Arrange advertised modes, scale, placement, and workspace assignments for enabled outputs through a guarded 20-second Preview. Manual new-connector geometry changes use native output management without writing monitor rules. Resume-aware refresh releases stale native ownership and blocks automation until enabled outputs settle safely. Apply is session-only. Profiles capture confirmed live arrangements; optional automatic restoration requires explicit consent and supported exact rules. Names, icons and order save separately. Forget performs confirmed configuration cleanup with exact backups.",
     "category": "Compositor",
     "allowMultiple": false
   },

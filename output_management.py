@@ -493,34 +493,18 @@ class Connection:
             raise ValueError("Native scale-check policy must be explicit.")
         targets = _indexed(positions, "native display target")
         enabled, heads, current = self._refresh(expected)
-        disabled = _indexed(expected.get("disabledMonitors", []), "disabled display")
-        connected = {**enabled, **disabled}
-        if not targets.keys() <= connected.keys():
-            raise ValueError("Native changes may target only expected connected displays.")
-        if targets and not any(position.get("enabled", True) for position in targets.values()):
-            raise ValueError("Keep at least one display enabled.")
-        topology_change = any(position.get("enabled", True) != (name in enabled)
-                              for name, position in targets.items())
-        if topology_change and targets.keys() != connected.keys():
-            raise ValueError("Enable-state changes must describe every connected display.")
+        if not targets.keys() <= enabled.keys():
+            raise ValueError("Native geometry changes may target only enabled displays.")
         prepared = []
         for name, position in targets.items():
-            target_enabled = position.get("enabled", True)
-            if type(target_enabled) is not bool:
-                raise ValueError("Native display enabled state must be explicit.")
             head_id, head = heads[name]
-            if not target_enabled:
-                if name in disabled:
-                    continue
-                prepared.append((head_id, False, None, None, None))
-                continue
             target = _geometry(position)
             fixed = _scale_fixed(target, scale_checks)
-            original = connected[name]
-            before = _geometry(original) if name in enabled else None
+            original = enabled[name]
+            before = _geometry(original)
             if before is not None:
                 _scale_fixed(before, scale_checks)
-            options = original.get("modeOptions") if name in enabled else position.get("modeOptions")
+            options = original.get("modeOptions")
             if not isinstance(options, list) or not all(isinstance(mode, dict) for mode in options):
                 raise ValueError("Native mode changes require the saved advertised mode catalog.")
             unchanged = before is not None and _same_mode(before, target)
@@ -557,7 +541,7 @@ class Connection:
                         # with the same public timing. They are indistinguishable
                         # to clients; either produces the verified target mode.
                         mode_id = nearest[0]
-            prepared.append((head_id, True, mode_id, target, fixed))
+            prepared.append((head_id, mode_id, target, fixed))
         return prepared
 
     def plan(self, expected, positions, *, scale_checks=True):
@@ -565,22 +549,16 @@ class Connection:
         self._prepare(expected, positions, scale_checks)
 
     def apply(self, expected, positions, *, scale_checks=True):
-        """Commit selected geometry and enabled states through one retained owner."""
+        """Commit selected geometry through one retained owner."""
         prepared = self._prepare(expected, positions, scale_checks)
         if not prepared:
             return
-        count = sum(2 if item[1] else 1 for item in prepared) + 1
+        count = len(prepared) * 2 + 1
         if len(self._objects) + count >= _MAX_OBJECTS or self._next_id + count >= _SERVER_IDS:
             raise ValueError("Native output-management resource limit reached.")
         configuration, state = self._new("configuration", result=None)
         requests = [(self._manager, 0, struct.pack("=II", configuration, self._serial))]
-        for head_id, target_enabled, mode_id, target, fixed in prepared:
-            if not target_enabled:
-                # Hyprland 0.56.2 records this request before Apply. Every
-                # target is fully preflighted above; the independent watchdog
-                # owns recovery if the subsequent Apply or verification fails.
-                requests.append((configuration, 1, struct.pack("=I", head_id)))
-                continue
+        for head_id, mode_id, target, fixed in prepared:
             config_head, _ = self._new("configuration_head")
             requests.append((configuration, 0, struct.pack("=II", config_head, head_id)))
             if mode_id is not None:
@@ -593,8 +571,8 @@ class Connection:
         try:
             for object_id, opcode, payload in requests:
                 self._send(object_id, opcode, payload, deadline)
-            self._mode_overrides.update(head_id for head_id, enabled, mode_id, _, _ in prepared
-                                        if enabled and mode_id is not None)
+            self._mode_overrides.update(head_id for head_id, mode_id, _, _ in prepared
+                                        if mode_id is not None)
             self._wait(lambda: state["result"] is not None, deadline)
             if state["result"] == 1:
                 raise ValueError("Native display configuration failed.")
@@ -605,15 +583,6 @@ class Connection:
                 self._send(configuration, 4)
         self._roundtrip()
         targets = _indexed(positions, "native display target")
-        intended_enabled, intended_disabled = [], []
-        for monitor in expected["monitors"] + expected.get("disabledMonitors", []):
-            target = targets.get(monitor["name"])
-            if target is None:
-                (intended_disabled if monitor.get("disabled") else intended_enabled).append(monitor)
-            elif target.get("enabled", True):
-                intended_enabled.append({**monitor, **target, "disabled": False})
-            else:
-                intended_disabled.append({key: monitor.get(key, "") for key in _IDENTITY_FIELDS}
-                                         | {"disabled": True})
-        self._refresh({**expected, "monitors": intended_enabled,
-                       "disabledMonitors": intended_disabled})
+        intended = [{**monitor, **targets.get(monitor["name"], {}), "disabled": False}
+                    for monitor in expected["monitors"]]
+        self._refresh({**expected, "monitors": intended})

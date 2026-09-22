@@ -27,7 +27,6 @@ TERMINAL = {"kept", "reverted", "failed"}
 IDENTITY = ("id", "name", "description", "make", "model", "serial")
 GEOMETRY = ("width", "height", "scale", "transform", "refreshRate", "disabled", "mirrorOf")
 POSITION = ("name", "x", "y", "width", "height", "refreshRate", "scale", "transform")
-TARGET = POSITION + ("enabled",)
 SETTINGS = ("currentFormat", "colorManagementPreset", "sdrBrightness", "sdrSaturation",
             "sdrMinLuminance", "sdrMaxLuminance", "vrr")
 TOKEN_RE = re.compile(r"[0-9a-f]{48}\Z")
@@ -122,22 +121,12 @@ def logical_size(position, transform):
 
 def expected_outputs(baseline, positions):
     targets = indexed(positions, "name", "display target")
-    enabled, disabled = [], []
-    connected = baseline["monitors"] + baseline.get("restorableMonitors", [])
-    for monitor in connected:
-        target = targets.get(monitor["name"])
-        if target is None or target.get("enabled", True):
-            expected = {**monitor, **(target or {})}
-            if monitor.get("disabled") is True:
-                expected["disabled"] = False
-            expected["logicalWidth"], expected["logicalHeight"] = logical_size(expected, expected["transform"])
-            enabled.append(expected)
-        else:
-            disabled.append({key: monitor.get(key) for key in IDENTITY} | {"disabled": True})
-    known = {m["name"] for m in connected}
-    disabled.extend(m for m in baseline.get("disabledMonitors", [])
-                    if m["name"] not in known)
-    return {**baseline, "monitors": enabled, "disabledMonitors": disabled}
+    enabled = []
+    for monitor in baseline["monitors"]:
+        expected = {**monitor, **targets.get(monitor["name"], {})}
+        expected["logicalWidth"], expected["logicalHeight"] = logical_size(expected, expected["transform"])
+        enabled.append(expected)
+    return {**baseline, "monitors": enabled}
 
 
 def snapshot():
@@ -183,10 +172,6 @@ def snapshot():
               "disabledMonitors": disabled, "mirroredOutputs": mirrors, "unavailableMonitors": unavailable,
               "workspaces": query("workspaces"), "activeWindow": query("activewindow").get("address", ""),
               "session": os.environ.get("HYPRLAND_INSTANCE_SIGNATURE", "")}
-    result["restorableMonitors"] = output_owner.restorable(sys.modules[__name__], runtime_dir(), result)
-    result["redockMonitors"] = output_owner.redock_layout(sys.modules[__name__], runtime_dir(), result)
-    result["redockWorkspaces"] = output_owner.redock_workspaces(
-        sys.modules[__name__], runtime_dir(), result)
     return result
 
 
@@ -254,30 +239,12 @@ def validate(request, current=None, *, allow_new=True):
     current = snapshot() if current is None else current
     monitors = compare_outputs(baseline, current, catalog=True)
     active = dict(monitors)
-    restorable = indexed(baseline.get("restorableMonitors", []), "name", "restorable display")
-    live_restorable = indexed(current.get("restorableMonitors", []), "name", "restorable display")
-    if restorable.keys() != live_restorable.keys() or any(
-            not same_fields(m, live_restorable[name], IDENTITY + GEOMETRY + SETTINGS + ("x", "y"))
-            for name, m in restorable.items()):
-        raise ValueError("Restorable disabled displays changed. Refresh the panel.")
-    redock = indexed(baseline.get("redockMonitors", []), "name", "redock display")
-    live_redock = indexed(current.get("redockMonitors", []), "name", "redock display")
-    if redock.keys() != live_redock.keys() or any(
-            not same_fields(m, live_redock[name], IDENTITY + GEOMETRY + SETTINGS + ("x", "y"))
-            for name, m in redock.items()):
-        raise ValueError("Redock geometry changed. Refresh the panel.")
-    if baseline.get("redockWorkspaces", []) != current.get("redockWorkspaces", []):
-        raise ValueError("Redock workspace journal changed. Refresh the panel.")
-    candidates = {**active, **restorable}
     positions = indexed(request.get("positions"), "name", "display target")
-    if positions.keys() != candidates.keys():
-        raise ValueError("Provide exactly one target for every available display.")
-    normalized, sizes, enabled_names = [], {}, set()
+    if positions.keys() != active.keys():
+        raise ValueError("Provide exactly one target for every enabled display.")
+    normalized, sizes = [], {}
     for name, position in positions.items():
-        monitor = candidates[name]
-        enabled = position.get("enabled", True)
-        if type(enabled) is not bool:
-            raise ValueError("Display enabled state must be explicit.")
+        monitor = active[name]
         target = {"name": name,
                   "x": numeric(position.get("x"), "X coordinate", -COORD_LIMIT, COORD_LIMIT, True),
                   "y": numeric(position.get("y"), "Y coordinate", -COORD_LIMIT, COORD_LIMIT, True),
@@ -285,9 +252,7 @@ def validate(request, current=None, *, allow_new=True):
                   "height": numeric(position.get("height"), "display height", 1, 65536, True),
                   "refreshRate": numeric(position.get("refreshRate"), "display refresh rate", 0.001, 1000),
                   "scale": numeric(position.get("scale"), "display scale", 0.1, 16),
-                  "transform": numeric(position.get("transform"), "display rotation", 0, 7, True),
-                  "enabled": enabled,
-                  "modeOptions": monitor.get("modeOptions", [])}
+                  "transform": numeric(position.get("transform"), "display rotation", 0, 7, True)}
         mode_keys = ("width", "height", "refreshRate")
         if same_fields(monitor, target, mode_keys):
             target.update({key: monitor[key] for key in mode_keys})
@@ -300,22 +265,18 @@ def validate(request, current=None, *, allow_new=True):
         sizes[name] = logical_size(target, target["transform"])
         target["scale"] = round(target["scale"] * 120) / 120
         normalized.append(target)
-        if enabled:
-            enabled_names.add(name)
-    if not enabled_names:
-        raise ValueError("Keep at least one display enabled.")
-    enabled_positions = [position for position in normalized if position["enabled"]]
-    min_x, min_y = min(p["x"] for p in enabled_positions), min(p["y"] for p in enabled_positions)
-    for position in enabled_positions:
+    enabled_names = set(active)
+    min_x, min_y = min(p["x"] for p in normalized), min(p["y"] for p in normalized)
+    for position in normalized:
         position["x"] -= min_x
         position["y"] -= min_y
         width, height = sizes[position["name"]]
         if position["x"] + width > COORD_LIMIT or position["y"] + height > COORD_LIMIT:
             raise ValueError("The display layout is too large.")
-    edges = {p["name"]: set() for p in enabled_positions}
-    for index, a in enumerate(enabled_positions):
+    edges = {p["name"]: set() for p in normalized}
+    for index, a in enumerate(normalized):
         aw, ah = sizes[a["name"]]
-        for b in enabled_positions[index + 1:]:
+        for b in normalized[index + 1:]:
             bw, bh = sizes[b["name"]]
             dx = min(a["x"] + aw, b["x"] + bw) - max(a["x"], b["x"])
             dy = min(a["y"] + ah, b["y"] + bh) - max(a["y"], b["y"])
@@ -324,37 +285,14 @@ def validate(request, current=None, *, allow_new=True):
             if (dx == 0 and dy > 0) or (dy == 0 and dx > 0):
                 edges[a["name"]].add(b["name"])
                 edges[b["name"]].add(a["name"])
-    reached, pending = set(), [enabled_positions[0]["name"]]
+    reached, pending = set(), [normalized[0]["name"]]
     while pending:
         name = pending.pop()
         if name not in reached:
             reached.add(name)
             pending.extend(edges[name] - reached)
     if reached != enabled_names:
-        raise ValueError("Enabled displays must share an edge; gaps and corner-only contact are not allowed.")
-    undock = request.get("undock", False)
-    if type(undock) is not bool:
-        raise ValueError("Invalid safe-undock request.")
-    if undock:
-        if not enabled_names or any(not name.startswith("eDP-") for name in enabled_names):
-            raise ValueError("Undock safely must leave only a healthy internal display enabled.")
-        if not any(name in active and not positions[name].get("enabled", True)
-                   for name in active if not name.startswith("eDP-")):
-            raise ValueError("Undock safely requires at least one enabled external display.")
-    commit = request.get("commit", "")
-    if commit not in ("", "undock", "redock"):
-        raise ValueError("Invalid immediate topology action.")
-    if commit == "undock" and not undock:
-        raise ValueError("Immediate undock requires the safe-undock topology.")
-    if commit == "redock":
-        if undock or not baseline.get("restorableMonitors"):
-            raise ValueError("Redock safely requires displays disabled by this session.")
-        if enabled_names != set(candidates):
-            raise ValueError("Redock safely must enable every available display.")
-        targets = indexed(normalized, "name", "redock target")
-        if redock.keys() != targets.keys() or any(
-                not same_fields(monitor, targets[name], POSITION) for name, monitor in redock.items()):
-            raise ValueError("Redock safely must restore the complete journaled display layout.")
+        raise ValueError("Displays must share an edge; gaps and corner-only contact are not allowed.")
     changes = indexed(request.get("workspaces"), "id", "workspace move")
     old_ws = indexed(baseline.get("workspaces"), "id", "baseline workspace")
     live_ws = indexed(current["workspaces"], "id", "live workspace")
@@ -370,24 +308,6 @@ def validate(request, current=None, *, allow_new=True):
         if source == target:
             raise ValueError("Include only changed workspace placements.")
         moves.append({"id": wid, "source": source, "target": target})
-    if commit == "redock":
-        saved_redock = indexed(baseline.get("redockWorkspaces", []), "id", "redock workspace")
-        redock_state = {"workspaces": list(saved_redock.values())}
-        for wid, saved in saved_redock.items():
-            live = live_ws.get(wid)
-            if live is None:
-                if workspace_may_expire(redock_state, wid):
-                    continue
-                raise ValueError(f"Redock workspace {wid} disappeared.")
-            target = changes.get(wid, {}).get("target", live["monitor"])
-            if saved.get("monitor") not in enabled_names or target != saved.get("monitor"):
-                raise ValueError(f"Redock safely must restore workspace {wid} to {saved.get('monitor')}.")
-    disabling = {name for name in active if name not in enabled_names}
-    unmoved = sorted(wid for wid, workspace in old_ws.items()
-                     if wid > 0 and workspace.get("monitor") in disabling and wid not in changes)
-    if unmoved:
-        raise ValueError("Move every workspace off displays being disabled: "
-                         + ", ".join(map(str, unmoved)) + ".")
     profile = request.get("profileWorkspaces")
     removals = []
     if profile is not None:
@@ -424,29 +344,17 @@ def validate(request, current=None, *, allow_new=True):
         retained.update({placement["id"]: placement["target"] for placement in profile})
         if set(retained.values()) != enabled_names:
             raise ValueError("Keep at least one saved or populated workspace on every enabled display.")
-    state_changes = sum(position.get("enabled", True) != (name in active)
-                        for name, position in positions.items())
-    if state_changes and profile is not None:
-        raise ValueError("Enable-state changes cannot be combined with a loaded profile draft.")
-    if commit and not state_changes:
-        raise ValueError("Immediate topology action has no display state change.")
-    count = sum(position["enabled"] != (position["name"] in active)
-                or position["enabled"] and not same_fields(position, candidates[position["name"]], POSITION)
+    count = sum(not same_fields(position, active[position["name"]], POSITION)
                 for position in normalized)
-    if not state_changes:
-        normalized = [{key: position[key] for key in POSITION} for position in normalized]
     if count and live_validation:
-        if state_changes:
+        missing = check_monitor_rules(active, allow_new=allow_new)
+        if missing:
             output_owner.preflight(sys.modules[__name__], current, normalized)
-        else:
-            missing = check_monitor_rules(active, allow_new=allow_new)
-            if missing:
-                output_owner.preflight(sys.modules[__name__], current, normalized)
     workspace_count = len({move["id"] for move in moves}
                           | {placement["id"] for placement in profile or []} | set(removals))
     return {"ok": True, "positions": normalized, "workspaces": moves, "profileWorkspaces": profile,
-            "removeWorkspaces": removals, "displayChanges": count, "enableChanges": state_changes,
-            "workspaceChanges": workspace_count, "commit": commit,
+            "removeWorkspaces": removals, "displayChanges": count,
+            "workspaceChanges": workspace_count,
             "message": (f"{count} display change(s), {workspace_count} workspace change(s)."
                         + (f" Restore/retain {len(profile)} saved workspace(s); retire {len(removals)} empty extra(s)."
                            if profile is not None else ""))}
@@ -730,6 +638,33 @@ def resume():
         return {**response(state), "baseline": state["baseline"], "plan": state["plan"],
                 "uiScreen": state.get("uiScreen", state["baseline"]["monitors"][0]["name"])}
 
+def resume_refresh():
+    """Release stale geometry ownership and report fresh post-suspend health."""
+    root = runtime_dir()
+    with locked(root):
+        display_automation.suppress(sys.modules[__name__], root)
+        active = root / "active.json"
+        if active.exists():
+            state = load(root, json.loads(active.read_text())["token"])
+            expire_unstarted(root, state)
+            if state["state"] not in TERMINAL:
+                state["request"] = "revert"
+                save(root, state)
+                return {"ok": False, "status": "reverting",
+                        "message": "System resumed during a display preview; reverting before refresh."}
+        try:
+            require_no_forget(root)
+            output_owner.release_after_resume(sys.modules[__name__], root)
+            current = snapshot()
+        except Exception as error:
+            return {"ok": False, "status": "blocked",
+                    "message": f"Post-resume display refresh is blocked: {error}"}
+        healthy = bool(current["monitors"]) and not current.get("unavailableMonitors")
+        return {**current, "resumeHealthy": healthy, "status": "ready" if healthy else "blocked",
+                "message": ("Displays settled after resume."
+                            if healthy else "Displays are not healthy after resume; layout automation remains blocked.")}
+
+
 
 def begin(request):
     root = runtime_dir()
@@ -746,17 +681,11 @@ def begin_locked(root, request, *, automatic_profile=None):
     plan = validate(request, current)
     monitor_backend = "rules"
     if plan["displayChanges"]:
-        if plan.get("enableChanges"):
-            if automatic_profile is not None:
-                raise ValueError("Automatic restoration cannot change enabled displays.")
+        missing = check_monitor_rules((m["name"] for m in current["monitors"]),
+                                      allow_new=automatic_profile is None)
+        if missing or output_owner.active(sys.modules[__name__], root):
             output_owner.preflight(sys.modules[__name__], current, plan["positions"])
             monitor_backend = "output-management"
-        else:
-            missing = check_monitor_rules((m["name"] for m in current["monitors"]),
-                                          allow_new=automatic_profile is None)
-            if missing or output_owner.active(sys.modules[__name__], root):
-                output_owner.preflight(sys.modules[__name__], current, plan["positions"])
-                monitor_backend = "output-management"
     if not plan["displayChanges"] and not plan["workspaceChanges"]:
         raise ValueError("There are no arrangement changes to try.")
     if not shutil.which("systemd-run") or not shutil.which("hyprctl"):
@@ -867,27 +796,6 @@ def set_positions(baseline, positions, force=False, recovery=False, owner=None):
     lua_eval(''.join("do " + guard + "end; " for guard, _ in pieces) + ''.join(code for _, code in pieces))
 
 
-def apply_topology(current, positions):
-    """Apply a complete enabled topology through Hyprland's Lua monitor rules."""
-    live = indexed(current["monitors"], "name", "display")
-    disabled = indexed(current.get("disabledMonitors", []), "name", "disabled display")
-    targets = indexed(positions, "name", "display target")
-    if targets.keys() != live.keys() | disabled.keys():
-        raise ValueError("Provide exactly one target for every connected display.")
-    if not any(position.get("enabled", True) for position in positions):
-        raise ValueError("At least one display must remain enabled.")
-    guards = [monitor_guard(monitor) for monitor in live.values()]
-    rules = []
-    for position in positions:
-        fields = {"output": position["name"], "disabled": not position.get("enabled", True)}
-        if not fields["disabled"]:
-            fields.update(position=f"{position['x']}x{position['y']}",
-                          mode=f"{position['width']}x{position['height']}@{position['refreshRate']}",
-                          scale=position["scale"], transform=position["transform"])
-        encoded = ",".join(f"{key}={lua_string(value) if isinstance(value, str) else str(value).lower()}"
-                           for key, value in fields.items())
-        rules.append(f"hl.monitor({{{encoded}}}); ")
-    lua_eval("".join("do " + guard + "end; " for guard in guards) + "".join(rules))
 
 
 def workspace_may_expire(baseline, wid):
@@ -898,8 +806,7 @@ def workspace_may_expire(baseline, wid):
 
 
 def move_workspace(baseline, wid, target, expected_source=None, recovery=False, expected=None):
-    originals = indexed(baseline["monitors"] + baseline.get("restorableMonitors", []),
-                        "name", "display")
+    originals = indexed(baseline["monitors"], "name", "display")
     may_expire = workspace_may_expire(baseline, wid)
     current = snapshot()
     if not recovery:
@@ -1069,35 +976,25 @@ def finish_profile_rollback(state):
 
 def rollback(state):
     baseline, errors = state["baseline"], []
-    # Restore all compatible outputs together; topology changes are owned by
-    # the retained native connection and guarded by its before/after journal.
+    # Restore compatible outputs together while preserving unrelated external edits.
     try:
         current = snapshot()
         if baseline.get("session") != current.get("session"):
             return ["The compositor session changed; refusing to restore an old arrangement."]
-        if state["plan"].get("enableChanges") and state.get("outputOwner"):
-            positions = [{**{key: monitor[key] for key in POSITION}, "enabled": True,
-                          "modeOptions": monitor.get("modeOptions", [])}
-                         for monitor in baseline["monitors"]]
-            positions.extend({**{key: monitor[key] for key in POSITION}, "enabled": False,
-                              "modeOptions": monitor.get("modeOptions", [])}
-                             for monitor in baseline.get("restorableMonitors", []))
-            set_positions(current, positions, force=True, recovery=True, owner=state["outputOwner"])
-        else:
-            live = indexed(current["monitors"], "name", "display")
-            targets = indexed(expected_outputs(baseline, state["plan"]["positions"])["monitors"], "name", "display")
-            positions = []
-            for monitor in baseline["monitors"]:
-                now = live.get(monitor["name"])
-                if now is None or not same_identity(monitor, now):
-                    errors.append(f"Display {monitor['name']} disconnected or was replaced.")
-                elif not any(same_fields(expected, now, GEOMETRY + ("x", "y"))
-                             for expected in (monitor, targets[monitor["name"]])):
-                    errors.append(f"Display {monitor['name']} changed externally; preserving its geometry.")
-                else:
-                    positions.append({key: monitor[key] for key in POSITION})
-            if positions and state["plan"]["displayChanges"]:
-                set_positions(current, positions, force=True, recovery=True, owner=state.get("outputOwner"))
+        live = indexed(current["monitors"], "name", "display")
+        targets = indexed(expected_outputs(baseline, state["plan"]["positions"])["monitors"], "name", "display")
+        positions = []
+        for monitor in baseline["monitors"]:
+            now = live.get(monitor["name"])
+            if now is None or not same_identity(monitor, now):
+                errors.append(f"Display {monitor['name']} disconnected or was replaced.")
+            elif not any(same_fields(expected, now, GEOMETRY + ("x", "y"))
+                         for expected in (monitor, targets[monitor["name"]])):
+                errors.append(f"Display {monitor['name']} changed externally; preserving its geometry.")
+            else:
+                positions.append({key: monitor[key] for key in POSITION})
+        if positions and state["plan"]["displayChanges"]:
+            set_positions(current, positions, force=True, recovery=True, owner=state.get("outputOwner"))
     except Exception as error:
         errors.append(str(error))
     if state.get("profileJournal"):
@@ -1174,9 +1071,7 @@ def worker(root, token):
                         return
                     request = {"baseline": state["baseline"], "positions": state["plan"]["positions"],
                                "workspaces": state["plan"]["workspaces"],
-                               "profileWorkspaces": state["plan"].get("profileWorkspaces"),
-                               "undock": state["plan"].get("commit") == "undock",
-                               "commit": state["plan"].get("commit", "")}
+                               "profileWorkspaces": state["plan"].get("profileWorkspaces")}
                     authorization = (display_automation.worker_request(sys.modules[__name__], state)
                                      if state.get("automatic", False) else contextlib.nullcontext(request))
                     with authorization as request:
@@ -1226,17 +1121,6 @@ def worker(root, token):
                 settle_trial(state)
                 with locked(root):
                     latest = load(root, token)
-                    if state["plan"].get("commit"):
-                        verify_trial(state)
-                        if state.get("outputOwner"):
-                            output_owner.finish(root, state["outputOwner"], keep=True)
-                        action = state["plan"]["commit"]
-                        state.update(request=latest.get("request", ""), state="kept", phase="finished",
-                                     message=("Undocked safely for this session."
-                                              if action == "undock"
-                                              else "All session-disabled displays re-enabled."))
-                        save(root, state)
-                        return
                     state.update(request=latest.get("request", ""), state="pending", phase="waiting",
                                  deadline=time.monotonic() + CONFIRM_SECONDS,
                                  message=(f"Restoring {state['profileName']} automatically. Verifying for 20 seconds, then keeping for this session. Open the arrangement panel to Revert."
@@ -1438,6 +1322,8 @@ def main():
         return {"ok": True, "message": "Forget worker finished."}
     if command == "resume" and len(sys.argv) == 2:
         return resume()
+    if command == "resume-refresh" and len(sys.argv) == 2:
+        return resume_refresh()
     if command == "auto-check" and len(sys.argv) == 3:
         if len(sys.argv[2]) > 4096:
             raise ValueError("Automatic check request is too large.")

@@ -4,7 +4,6 @@ import copy
 import os
 from pathlib import Path
 import socket
-import struct
 import threading
 import time
 import unittest
@@ -31,7 +30,6 @@ class OutputOwnerTests(unittest.TestCase):
         self.stack.enter_context(patch.object(arrangement, "query", side_effect=self.query))
         self.stack.enter_context(patch.object(arrangement, "run", side_effect=self.run_command))
         self.stack.enter_context(patch.object(arrangement, "lua_eval", side_effect=AssertionError("No Lua monitor mutations")))
-        self.stack.enter_context(patch.object(arrangement, "apply_topology", side_effect=self.apply_topology))
         self.event_path = Path(os.environ["XDG_RUNTIME_DIR"]) / "hypr" / os.environ["HYPRLAND_INSTANCE_SIGNATURE"] / ".socket2.sock"
         self.event_path.parent.mkdir(parents=True)
         self.event_listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -70,33 +68,6 @@ class OutputOwnerTests(unittest.TestCase):
             return "true\t" + str(self.monitor_file)
         raise AssertionError("Unexpected external command: " + str(args))
 
-    def apply_topology(self, current, positions):
-        with self.server.lock:
-            targets = {position["name"]: position for position in positions}
-            for head in self.server.heads:
-                target = targets[head["name"]]
-                head["disabled"] = not target.get("enabled", True)
-                if not head["disabled"]:
-                    head.update({key: target[key] for key in arrangement.POSITION if key != "name"})
-            for peer in self.server.peers:
-                if peer.manager is None or peer.client.fileno() < 0:
-                    continue
-                try:
-                    for head in self.server.heads:
-                        peer.event(peer.wire(head)["object"], 4,
-                                   struct.pack("=i", int(not head["disabled"])))
-                        if not head["disabled"]:
-                            peer.publish_geometry(head)
-                    peer.done()
-                except OSError:
-                    continue
-        changed = next((position["name"] for position in positions
-                        if position.get("enabled", True) != any(
-                            monitor["name"] == position["name"] for monitor in current["monitors"])), None)
-        if changed and self.events:
-            self.events[-1].sendall(
-                (("monitoraddedv2>>" if targets[changed].get("enabled", True) else "monitorremoved>>")
-                 + changed + "\n").encode())
 
     def start_owner(self):
         def serve():
@@ -242,68 +213,22 @@ class OutputOwnerTests(unittest.TestCase):
         self.assertTrue(self.server.overrides)
         self.assertEqual(self.monitor_file.read_bytes(), self.original)
 
-    def test_owner_restart_releases_when_disabled_output_identity_changed(self):
-        state, _ = self.trial("keep")
-        self.assertEqual(state["state"], "kept", state["message"])
-        peer = next(peer for peer in self.server.peers if peer.overrides)
-        peer.disconnected.set()
-        peer.client.shutdown(socket.SHUT_RDWR)
-        self.owners[-1].join(3)
-        self.assertFalse(self.owners[-1].is_alive())
-        with self.server.lock:
-            next(head for head in self.server.heads if head["disabled"])["serial"] = "replacement-output"
-        current = arrangement.snapshot()
-        owner = threading.Thread(target=output_owner.serve, args=(arrangement, self.root), daemon=True)
-        self.owners.append(owner)
-        owner.start()
-        owner.join(3)
-        self.assertFalse(owner.is_alive())
-        self.assertTrue(output_owner.load(arrangement, self.root)["stopped"])
-        self.assertFalse(self.server.overrides)
-        self.assertEqual(arrangement.snapshot(), current)
-        self.assertEqual(self.monitor_file.read_bytes(), self.original)
 
-    def test_kept_disabled_display_is_offered_for_safe_reenable(self):
-        baseline = arrangement.snapshot()
-        targets = [{**{key: monitor[key] for key in arrangement.POSITION}, "enabled": True,
-                    "modeOptions": monitor["modeOptions"]}
-                   for monitor in baseline["monitors"]]
-        targets[1]["enabled"] = False
-        output_owner.apply(arrangement, self.root, baseline, targets, self.generation)
-        disabled = arrangement.snapshot()
-        self.assertEqual([m["name"] for m in disabled["restorableMonitors"]], ["HDMI-A-3"])
-        self.assertEqual([{key: monitor[key] for key in arrangement.POSITION}
-                          for monitor in disabled["redockMonitors"]],
-                         [{key: monitor[key] for key in arrangement.POSITION}
-                          for monitor in baseline["monitors"]])
-        self.assertEqual(disabled["redockWorkspaces"], baseline["workspaces"])
-        self.assertTrue(next(m for m in disabled["disabledMonitors"]
-                             if m["name"] == "HDMI-A-3")["disabled"])
-        output_owner.finish(self.root, self.generation, keep=True)
-        restored = [{**{key: monitor[key] for key in arrangement.POSITION}, "enabled": True,
-                     "modeOptions": monitor["modeOptions"]}
-                    for monitor in disabled["redockMonitors"]]
-        output_owner.apply(arrangement, self.root, disabled, restored, self.generation)
-        current = arrangement.snapshot()
-        self.assertEqual({m["name"] for m in current["monitors"]}, {"DP-7", "HDMI-A-3"})
-        self.assertEqual(current["restorableMonitors"], [])
-        self.assertEqual(self.monitor_file.read_bytes(), self.original)
 
-    def test_disable_rollback_reenables_original_topology(self):
-        baseline = arrangement.snapshot()
-        targets = [{**{key: monitor[key] for key in arrangement.POSITION}, "enabled": True,
-                    "modeOptions": monitor["modeOptions"]}
-                   for monitor in baseline["monitors"]]
-        targets[1]["enabled"] = False
-        output_owner.apply(arrangement, self.root, baseline, targets, self.generation)
-        state = {"baseline": baseline, "outputOwner": self.generation,
-                 "plan": {"positions": targets, "displayChanges": 1,
-                          "enableChanges": 1, "workspaces": []}}
-        self.assertEqual(arrangement.rollback(state), [])
-        current = arrangement.snapshot()
-        self.assertEqual({m["name"] for m in current["monitors"]}, {"DP-7", "HDMI-A-3"})
-        self.assertEqual(current["restorableMonitors"], [])
-
+    def test_resume_release_stops_unreachable_owner_without_restart(self):
+        state = {"version": 1, "generation": "a" * 48, "stopped": False}
+        with patch.object(output_owner, "load", side_effect=[state, state]), \
+                patch.object(output_owner, "call", side_effect=OSError("missing socket")), \
+                patch.object(arrangement, "run") as run, \
+                patch.object(arrangement, "atomic") as atomic:
+            output_owner.release_after_resume(arrangement, self.root)
+        run.assert_called_once_with(
+            ["systemctl", "--user", "stop",
+             "display-workspaces-output-" + self.root.name.rsplit("-", 1)[-1] + ".service"],
+            timeout=10)
+        saved = atomic.call_args.args[2]
+        self.assertTrue(saved["stopped"])
+        self.assertIn("resumed", saved["reason"])
 
 if __name__ == "__main__":
     unittest.main()
