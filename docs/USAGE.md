@@ -14,7 +14,6 @@ Name and icon changes update the existing workspace controls in place, preservin
 
 A unique hardware identity is preferred when matching saved settings after a connector changes. Connector names are the fallback. Disconnected displays retain their saved settings until explicitly forgotten.
 
-Display and workspace hotplug events refresh discovery automatically. One top-right dock-transition button reflects current state: **Undock safely…** when external outputs are active, or **Redock safely…** when this session owns disabled outputs.
 
 ## Session layout and workspace moves
 
@@ -27,7 +26,7 @@ Use **Displays** to select a display on the map, choose its advertised resolutio
 
 **The 20 seconds is only the live confirmation window.** Take as long as needed to edit the draft before Preview. After Apply completes, there is no countdown for reopening Profiles and saving the confirmed arrangement.
 
-Apply keeps resolution, scale, rotation, and arrangement **for this session only**. It does not persist display settings or workspace bindings into Hyprland configuration. Reloading configuration or restarting the session can reapply your existing rules. Profiles are saved separately; automatic restoration is off unless explicitly enabled for a profile. The plugin does not provide automatic mode/scale selection, custom modelines, rotation editing, or HDR controls.
+Apply keeps resolution, scale, rotation, and arrangement **for this session only**. It does not persist display settings or workspace bindings into Hyprland configuration. Reloading configuration or restarting the session can reapply your existing rules. Profiles are saved separately; automatic restoration is off unless explicitly enabled for a profile. The plugin does not provide output enable/disable, automatic mode/scale selection, custom modelines, rotation editing, or HDR controls.
 
 Resolution choices come from the display's advertised modes. Refresh rates remain distinct, such as 59.94 Hz and 60 Hz. An active custom/unadvertised mode can be retained; if no modes are advertised, resolution selection is disabled rather than guessed.
 
@@ -41,24 +40,14 @@ Hyprland can create temporary replacement workspaces when an active workspace mo
 
 When an output reports zero size or other invalid geometry, healthy displays and workspace cards remain visible. Names/icons/order and the configuration catalog remain accessible; unsafe layout actions stay blocked. This protects against bad geometry but does not fix the underlying driver, cable, or compositor problem.
 
-### Temporarily disabling displays and undocking safely
+### Output topology and docking
 
-In **Displays**, select an output and choose **Disable**. This edits only the draft. The plugin automatically stages every positive workspace currently targeting that output onto a remaining enabled display; review those moves in Workspaces, then use **Preview (20s) → Apply**. At least one output must remain enabled. Revert or expiry restores the prior enabled topology and workspace placement where the hardware remains available.
+The panel arranges only outputs that are already enabled and healthy. It does not enable or disable displays and does not provide Undock or Redock actions. Change output topology through Hyprland configuration or a dedicated display tool, then wait for hotplug discovery before arranging geometry or workspace placement here.
 
-After Apply, an output disabled by this session owner remains listed in the Display selector with **Enable**. Its complete prior geometry and mode catalog are held only in the private runtime journal, allowing a later guarded Preview to re-enable it. Displays already disabled by another tool or configuration are not guessed and cannot be enabled here.
+This plugin does not suspend the machine, power off or reset a dock, or repair a failed USB4/DisplayPort link. If a display reports zero size or disappears after resume, resolve the underlying hardware/compositor state first; layout Preview intentionally fails closed rather than guessing recovery geometry.
+The elected bar widget detects a system-suspend gap without installing a persistent service. On resume it suppresses profile automation, requests Revert for any interrupted Preview, releases stale native geometry ownership, refreshes monitor/workspace discovery, and waits for four identical healthy observations. If the outputs do not settle within ten seconds, automatic layout changes remain blocked. A later real monitor connection change retries the bounded refresh.
 
-Disabling an output can cause Hyprland to relocate its windows. The plugin manages workspace placement, not individual windows; re-enabling does not promise to return each window to its former screen. Enable-state changes use guarded runtime `hl.monitor` rules, are session-only, do not write `monitors.lua`, and cannot be combined with a loaded profile draft or automatic restoration. Geometry-only changes on new connectors continue to use native output management.
-
-Use **Undock safely… → Confirm undock** while the laptop and dock are still awake. Confirmation is the final action; there is no second Preview/Apply step. The independent worker still preflights the full topology, journals rollback before mutation, verifies the result, and restores the previous arrangement if application or verification fails. A successful action:
-
-1. Requires a healthy enabled internal output named `eDP-*`.
-2. Leaves only internal outputs enabled.
-3. Moves workspaces from every enabled external output to the internal display.
-4. Keeps the session-only topology immediately after verification.
-
-After success and while the laptop display remains healthy, physically disconnect the dock, wait for removal to register, and then suspend. The action does not suspend, power off the dock, reset USB4/DisplayPort MST, or guarantee recovery from a failed hardware link. It prevents the compositor from retaining external desktop space during deliberate undocking; it is not a kernel repair.
-
-While those disabled outputs remain physically connected and owned by the same compositor session, the same top-right control becomes **Redock safely… → Confirm redock**. It restores the complete pre-undock display geometry and workspace placement from the guarded runtime journal. Redock confirmation is final and uses the same preflight, verification, and failure rollback. Outputs disabled by another tool are never guessed. Manual Redock intentionally suppresses automatic-profile replay for that connection episode; it does not need automation because it restores the journaled workspace placement itself.
+This is fail-closed state recovery, not link repair. It never enables an output, resets a dock, reloads monitor configuration, or guesses geometry. A kernel or compositor failure still requires recovery outside the plugin.
 
 ### New connectors and session ownership
 

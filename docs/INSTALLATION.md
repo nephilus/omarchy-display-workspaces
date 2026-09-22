@@ -123,13 +123,19 @@ Forget now separates an obsolete connector rule from customization belonging to 
 
 Finish/revert active operations before upgrading. Before subsequent updates or removal, also run `python3 apply.py release-layout` from the installed plugin directory to release any session owner. Existing profiles and display preferences remain intact.
 
-## Upgrading from 2.5
+## Upgrading from 2.5 or 2.6.0
 
-Version 2.6 adds guarded session-only display Enable/Disable and one stateful **Undock safely / Redock safely** control. No plugin ID, settings, profile-store schema, dependency, startup service, or automatic-restoration consent changes. Existing profiles remain compatible.
+Version 2.6.1 removes the display Enable/Disable and Undock/Redock controls introduced in 2.6.0. Those topology changes did not recover reliably across connector and suspend/resume failures. The plugin now limits manual display changes to geometry for outputs that are already enabled and healthy.
 
-Finish/revert active operations and run `python3 apply.py release-layout` before updating from 2.5 so the old owner is not executing files while they are replaced. Restart the shell after updating to load the new controls. A display disabled by 2.6 can be safely re-enabled only while its owning compositor session and runtime journal remain available; release/configuration changes intentionally end that ownership.
+Finish or revert active operations and run `python3 apply.py release-layout` before updating so an old session owner is not executing files while they are replaced. Restart the shell after updating to remove cached controls. No plugin ID, settings, profile-store schema, dependency, startup service, or automatic-restoration consent changes. Existing profiles remain compatible.
 
-Undock safely requires a healthy internal `eDP-*` output. Confirmation is final: Undock moves external workspaces and disables external outputs; the same top-right control then becomes Redock safely and restores the complete journaled display geometry plus surviving pre-undock workspace placements. Both operations verify immediately and retain guarded rollback on application or verification failure. Redock validates workspace destinations against both currently enabled outputs and identity-verified outputs it is re-enabling. They do not suspend the machine or reset a failed dock link. Hyprland may relocate individual windows; this plugin restores workspace placement, not individual window history.
+Use Hyprland configuration or a dedicated display tool when output topology must change. The plugin does not prepare a dock for suspend or repair failed USB4/DisplayPort links.
+
+## Upgrading from 2.6.1
+
+Version 2.7 adds resume-aware display refresh without taking over suspend, lid, or output enable-state policy. After a detected suspend gap, the plugin releases stale native geometry ownership, refreshes monitor/workspace discovery, and blocks automatic layout changes until the enabled outputs report stable valid geometry. An interrupted Preview is reverted before ownership is released.
+
+Restart the shell after updating so the elected widget loads the resume observer. No persistent service, dependency, settings migration, profile-store migration, or new automation consent is added.
 
 ## Updating
 

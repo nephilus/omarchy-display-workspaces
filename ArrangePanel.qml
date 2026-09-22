@@ -64,8 +64,7 @@ Panel {
   readonly property var liveUnavailableMonitors: JSON.parse(unavailableGeometry)
   readonly property bool layoutBlocked: unavailableMonitors.length > 0 || liveUnavailableMonitors.length > 0
   readonly property var mapDisplays: displays.filter(function(m) {
-    var position = positions.filter(function(p) { return p.name === m.name })[0]
-    return position && position.enabled && !liveUnavailableMonitors.some(function(bad) { return bad.name === m.name })
+    return !liveUnavailableMonitors.some(function(bad) { return bad.name === m.name })
   })
   readonly property var workspaceDisplays: workspaceColumns()
   // Presentation edits update bindings without recreating columns and dropdowns.
@@ -82,8 +81,6 @@ Panel {
   property var profileWorkspaces: null
   property var removeWorkspaces: []
   property var geometryNotices: ({})
-  property bool undockCandidate: false
-  property bool redockCandidate: false
   property string message: ""
   property bool messageIsError: false
   property string validationMessage: "Loading current displays…"
@@ -446,9 +443,7 @@ Panel {
   function workspaceColumns() {
     var columns = displays.concat(unavailableMonitors).map(function(m) {
       var liveFault = liveUnavailableMonitors.filter(function(bad) { return bad.name === m.name })[0]
-      var position = positions.filter(function(p) { return p.name === m.name })[0]
-      return liveFault ? Object.assign({}, m, { reason: liveFault.reason })
-        : position && !position.enabled ? Object.assign({}, m, { reason: "Display will be disabled." }) : m
+      return liveFault ? Object.assign({}, m, { reason: liveFault.reason }) : m
     })
     draft.forEach(function(w) {
       if (columns.some(function(m) { return m.name === w.target })) return
@@ -499,17 +494,15 @@ Panel {
   function adoptSnapshot(result) {
     profileWorkspaces = null
     removeWorkspaces = []
-    undockCandidate = false
-    redockCandidate = false
     liveBaseline = result
-    displays = result.monitors.concat(result.restorableMonitors || []).map(function(m) {
+    displays = result.monitors.map(function(m) {
       return Object.assign({}, m, { label: m.name, icon: "\uf108" })
     })
     unavailableMonitors = (result.unavailableMonitors || []).map(function(m) { return Object.assign({}, m, { label: m.name, icon: "\uf108" }) })
     refreshPresentation()
     positions = displays.map(function(m) {
       return { name: m.name, x: m.x, y: m.y, width: m.width, height: m.height, refreshRate: m.refreshRate,
-        scale: m.scale, transform: m.transform, enabled: m.disabled !== true, modeOptions: m.modeOptions || [] }
+        scale: m.scale, transform: m.transform, modeOptions: m.modeOptions || [] }
     })
     geometryNotices = ({})
     draft = result.workspaces.filter(function(w) { return w.id > 0 }).map(function(w) {
@@ -543,10 +536,9 @@ Panel {
     validationMessage = "Loading current displays…"
     request("snapshot")
   }
-  function plan(commit) {
+  function plan() {
     return { baseline: liveBaseline, uiScreen: panelScreen, positions: positions,
-      profileWorkspaces: profileWorkspaces, undock: commit === "undock",
-      commit: commit || "",
+      profileWorkspaces: profileWorkspaces,
       workspaces: draft.filter(function(w) { return w.source !== null && w.source !== w.target }).map(function(w) {
         return { id: w.id, source: w.source, target: w.target }
       }) }
@@ -608,7 +600,7 @@ Panel {
     return -1
   }
   function editDisplayGeometry(fields, notice) {
-    if (!editable || !selectedPosition || !selectedPosition.enabled) return
+    if (!editable || !selectedPosition) return
     positions = positions.map(function(p) { return p.name === selectedName ? Object.assign({}, p, fields) : p })
     var notices = Object.assign({}, geometryNotices)
     notices[selectedName] = notice
@@ -617,88 +609,6 @@ Panel {
     messageIsError = false
     topologyNotice = ""
     changed()
-  }
-  function setDisplayEnabled(name, enabled) {
-    if (!editable || profileWorkspaces !== null) return
-    var position = positions.filter(function(p) { return p.name === name })[0]
-    if (!position || position.enabled === enabled) return
-    var enabledPositions = positions.filter(function(p) { return p.enabled && p.name !== name })
-    if (!enabled && enabledPositions.length === 0) {
-      message = "Keep at least one display enabled."
-      messageIsError = true
-      return
-    }
-    var destination = enabledPositions.filter(function(p) { return p.name.indexOf("eDP-") === 0 })[0]
-      || enabledPositions[0]
-    positions = positions.map(function(p) {
-      return p.name === name ? Object.assign({}, p, { enabled: enabled }) : p
-    })
-    if (!enabled) draft = draft.map(function(w) {
-      return w.target === name ? Object.assign({}, w, { target: destination.name }) : w
-    })
-    undockCandidate = false
-    redockCandidate = false
-    message = ""
-    messageIsError = false
-    topologyNotice = ""
-    changed()
-  }
-  function prepareUndock() {
-    if (!editable || profileWorkspaces !== null) return
-    var internal = positions.filter(function(p) { return p.enabled && p.name.indexOf("eDP-") === 0 })[0]
-    var external = positions.filter(function(p) { return p.enabled && p.name.indexOf("eDP-") !== 0 })
-    if (!internal || external.length === 0) {
-      message = !internal ? "Undock safely requires a healthy enabled internal display."
-        : "No enabled external displays need to be disabled."
-      messageIsError = true
-      return
-    }
-    if (!undockCandidate) {
-      undockCandidate = true
-      message = "Disable all external displays and move their workspaces to " + internal.name
-        + "? This takes effect immediately after confirmation."
-      messageIsError = false
-      return
-    }
-    var names = external.map(function(p) { return p.name })
-    positions = positions.map(function(p) {
-      return names.indexOf(p.name) >= 0 ? Object.assign({}, p, { enabled: false }) : p
-    })
-    draft = draft.map(function(w) {
-      return names.indexOf(w.target) >= 0 ? Object.assign({}, w, { target: internal.name }) : w
-    })
-    undockCandidate = false
-    message = "Undocking safely…"
-    messageIsError = false
-    request("begin", plan("undock"))
-  }
-  function prepareRedock() {
-    if (!editable || !liveBaseline || !(liveBaseline.restorableMonitors || []).length) return
-    if (!redockCandidate) {
-      redockCandidate = true
-      undockCandidate = false
-      message = "Re-enable every display disabled by this session? This takes effect immediately."
-      messageIsError = false
-      return
-    }
-    var saved = liveBaseline.redockMonitors || []
-    positions = positions.map(function(p) {
-      var original = saved.filter(function(m) { return m.name === p.name })[0]
-      return original ? {
-        name: original.name, x: original.x, y: original.y, width: original.width, height: original.height,
-        refreshRate: original.refreshRate, scale: original.scale, transform: original.transform,
-        enabled: true, modeOptions: original.modeOptions || p.modeOptions || []
-      } : Object.assign({}, p, { enabled: true })
-    })
-    var savedWorkspaces = liveBaseline.redockWorkspaces || []
-    draft = draft.map(function(w) {
-      var savedWorkspace = savedWorkspaces.filter(function(item) { return item.id === w.id })[0]
-      return savedWorkspace ? Object.assign({}, w, { target: savedWorkspace.monitor }) : w
-    })
-    redockCandidate = false
-    message = "Re-enabling all displays…"
-    messageIsError = false
-    request("begin", plan("redock"))
   }
   function selectDisplayMode(value) {
     if (!editable || !selectedDisplay || !selectedPosition || !(selectedDisplay.modeOptions || []).length) return
@@ -721,10 +631,8 @@ Panel {
   }
   function hasDisplayEdits() {
     return liveBaseline && positions.some(function(p) {
-      var original = liveBaseline.monitors.concat(liveBaseline.restorableMonitors || [])
-        .filter(function(m) { return m.name === p.name })[0]
-      return !original || p.enabled !== (original.disabled !== true)
-        || ["x", "y", "width", "height", "refreshRate", "scale", "transform"].some(function(field) {
+      var original = liveBaseline.monitors.filter(function(m) { return m.name === p.name })[0]
+      return !original || ["x", "y", "width", "height", "refreshRate", "scale", "transform"].some(function(field) {
           return original[field] !== p[field]
         })
     })
@@ -1062,17 +970,6 @@ Panel {
         Button { objectName: "workspaces-tab"; text: "Workspaces"; selected: root.page === 1; verticalPadding: Style.space(4); onClicked: root.page = 1 }
         Button { objectName: "profiles-tab"; text: "Profiles"; Accessible.name: "Profiles"; selected: root.page === 2; verticalPadding: Style.space(4); onClicked: root.page = 2 }
         Item { Layout.fillWidth: true }
-        Button {
-          objectName: "dock-transition"
-          readonly property bool canRedock: root.liveBaseline !== null
-            && (root.liveBaseline.restorableMonitors || []).length > 0
-          text: canRedock ? (root.redockCandidate ? "Confirm redock" : "Redock safely…")
-            : (root.undockCandidate ? "Confirm undock" : "Undock safely…")
-          verticalPadding: Style.space(4)
-          enabled: root.editable && root.profileWorkspaces === null
-          opacity: enabled ? 1 : 0.45
-          onClicked: canRedock ? root.prepareRedock() : root.prepareUndock()
-        }
       }
       RowLayout {
         width: parent.width
@@ -1159,14 +1056,6 @@ Panel {
               enabled: root.editable && count > 0
               onActivated: function(index) { if (model[index]) root.selectedName = model[index].name }
             }
-            Button {
-              objectName: "display-enabled-toggle"
-              text: root.selectedPosition && root.selectedPosition.enabled ? "Disable" : "Enable"
-              verticalPadding: Style.space(4)
-              enabled: root.editable && root.selectedPosition !== null && root.profileWorkspaces === null
-              opacity: enabled ? 1 : 0.45
-              onClicked: root.setDisplayEnabled(root.selectedName, !root.selectedPosition.enabled)
-            }
           }
           RowLayout {
             width: parent.width
@@ -1181,7 +1070,7 @@ Panel {
               textRole: "label"
               valueRole: "value"
               currentIndex: root.modeOptionIndex(model, root.selectedPosition)
-              enabled: root.editable && root.selectedPosition !== null && root.selectedPosition.enabled
+              enabled: root.editable && root.selectedPosition !== null
                 && root.selectedDisplay !== null && (root.selectedDisplay.modeOptions || []).length > 0
               onActivated: function(index) {
                 var option = model[index]
@@ -1197,7 +1086,7 @@ Panel {
               textRole: "label"
               valueRole: "value"
               currentIndex: root.scaleOptionIndex(model, root.selectedPosition)
-              enabled: root.editable && root.selectedPosition !== null && root.selectedPosition.enabled && count > 0
+              enabled: root.editable && root.selectedPosition !== null && count > 0
               onActivated: function(index) {
                 var option = model[index]
                 if (option) root.selectDisplayScale(option.value)
